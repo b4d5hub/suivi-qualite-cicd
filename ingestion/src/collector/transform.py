@@ -41,7 +41,7 @@ def transform_build(run):
     }
 
 
-def transform_job(job, run):
+def transform_job(job, run, attempt_number=None):
 
     # RAW JOB TIMESTAMPS
     started_at = job.get("started_at")
@@ -57,7 +57,9 @@ def transform_job(job, run):
     return {
         "job_id": job["id"],
         "run_id": run["id"],
-        "run_attempt": run.get("run_attempt", 1),
+        "run_attempt": (
+            attempt_number if attempt_number is not None else run.get("run_attempt", 1)
+        ),
         "head_sha": run.get("head_sha"),
         "job_name": job.get("name"),
         "status": job.get("status"),
