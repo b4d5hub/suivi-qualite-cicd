@@ -1,8 +1,10 @@
+import _collector_path
+
 import os
 import time
 from datetime import datetime, timedelta, timezone
 
-from backfill_range import subtract_months
+from backfill_deployments import subtract_months
 from github_client import list_workflow_runs
 
 

@@ -1,7 +1,9 @@
+import _collector_path
+
 from datetime import datetime, timedelta, timezone
 
 from github_client import list_deployments
-from backfill_deployments_preview import get_all_statuses
+from deployments import get_all_statuses
 
 
 def parse_time(value):

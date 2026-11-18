@@ -1,38 +1,11 @@
+import _collector_path
+
 import argparse
 from datetime import date
 
-from github_client import (
-    list_deployments,
-    list_deployment_statuses,
-)
+from deployments import get_all_statuses
+from github_client import list_deployments
 from transform import transform_deployment
-
-
-def get_all_statuses(deployment_id):
-
-    # ACCUMULATED STATUS RECORDS FOR THIS DEPLOYMENT
-    statuses = []
-    page = 1
-
-    # RETRIEVE EVERY AVAILABLE STATUS PAGE
-    while True:
-
-        batch, metadata = list_deployment_statuses(
-            deployment_id=deployment_id,
-            per_page=100,
-            page=page,
-        )
-
-        # ACCUMULATE STATUSES FROM THE CURRENT PAGE
-        statuses.extend(batch)
-
-        # STOP WHEN NO NEXT PAGE EXISTS
-        if not metadata["has_next"]:
-            break
-
-        page += 1
-
-    return statuses
 
 
 def preview_deployments(target_date, max_pages=3):

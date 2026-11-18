@@ -1,3 +1,5 @@
+import _collector_path
+
 import json
 
 from github_client import (

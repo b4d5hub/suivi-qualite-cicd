@@ -50,12 +50,12 @@ def main():
 
     workflows_ok = run_collector(
         "WORKFLOWS -> BUILDS + TESTS",
-        "incremental_to_kafka.py",
+        "workflows.py",
     )
 
     deployments_ok = run_collector(
         "DEPLOYMENTS",
-        "incremental_deployments_to_kafka.py",
+        "deployments.py",
         ["--apply"],
     )
 

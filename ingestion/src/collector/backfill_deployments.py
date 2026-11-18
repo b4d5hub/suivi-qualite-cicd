@@ -1,12 +1,11 @@
 import argparse
+import calendar
 import os
 import time
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
-from backfill_range import subtract_months
-from backfill_deployments_preview import get_all_statuses
-
+from deployments import get_all_statuses
 from github_client import list_deployments
 from transform import transform_deployment
 from kafka_producer import publish_messages
@@ -16,6 +15,21 @@ from state import (
     needs_publishing,
     remember_published,
 )
+
+
+def subtract_months(current_date, months):
+
+    # CONVERT THE DATE TO A MONTH INDEX, THEN SHIFT BACK BY N MONTHS
+    total_month = current_date.year * 12 + current_date.month - 1 - months
+
+    # SPLIT THE INDEX BACK INTO YEAR AND 1-BASED MONTH
+    year, zero_based_month = divmod(total_month, 12)
+    month = zero_based_month + 1
+
+    # CLAMP THE DAY SO IT FITS THE TARGET MONTH (E.G. JAN 31 -> FEB 28/29)
+    day = min(current_date.day, calendar.monthrange(year, month)[1])
+
+    return date(year, month, day)
 
 
 def main():

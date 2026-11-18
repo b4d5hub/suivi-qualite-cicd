@@ -1,3 +1,5 @@
+import _collector_path
+
 import requests
 from confluent_kafka import KafkaException
 from github_client import (

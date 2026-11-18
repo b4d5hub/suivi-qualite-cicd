@@ -1,14 +1,11 @@
+import _collector_path
+
 from datetime import datetime, timedelta, timezone
 
 from github_client import list_workflow_runs
-from backfill_to_kafka import prepare_run_messages
-from state import open_state, needs_publishing
-
-
-def parse_time(value):
-
-    # PARSE AN ISO 8601 TIMESTAMP (NORMALIZE "Z" TO "+00:00")
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+from state import needs_publishing, open_state
+from transform import parse_time
+from workflows import prepare_run_messages
 
 
 def collect_recent_runs(now):

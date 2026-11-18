@@ -1,7 +1,9 @@
+import _collector_path
+
 import argparse, os
 from datetime import datetime, timezone
 
-from backfill_range import subtract_months
+from backfill_deployments import subtract_months
 from github_client import list_deployments
 
 

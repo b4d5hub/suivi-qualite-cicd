@@ -1,3 +1,5 @@
+import _collector_path
+
 import requests
 
 from github_client import list_deployments, list_deployment_statuses

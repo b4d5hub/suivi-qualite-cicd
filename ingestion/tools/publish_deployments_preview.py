@@ -1,3 +1,5 @@
+import _collector_path
+
 import argparse
 from datetime import date
 

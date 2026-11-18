@@ -1,3 +1,5 @@
+import _collector_path
+
 from datetime import datetime, timedelta, timezone
 
 from github_client import list_workflow_runs

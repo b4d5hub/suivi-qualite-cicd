@@ -1,25 +1,23 @@
 import argparse
-import json
 import time
-
 from datetime import datetime, timedelta, timezone
 
-from github_client import list_deployments
-from backfill_deployments_preview import get_all_statuses
-from transform import transform_deployment
+from github_client import list_deployments, list_deployment_statuses
 from kafka_producer import publish_messages
-
 from state import (
-    open_state,
-    needs_publishing,
-    remember_published,
-)
-
-from polling_state import (
     ensure_polling_table,
+    ensure_watch_table,
+    forget_watched,
     get_last_poll,
+    load_watched_deployments,
+    needs_publishing,
+    open_state,
     record_successful_poll,
+    remember_published,
+    remember_watched,
+    table_exists,
 )
+from transform import parse_time, transform_deployment
 
 STREAM = "deployments"
 LOOKBACK = timedelta(days=7)
@@ -36,89 +34,31 @@ TERMINAL_STATES = {
 }
 
 
-def parse_time(value):
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+def get_all_statuses(deployment_id):
 
+    # ACCUMULATED STATUS RECORDS FOR THIS DEPLOYMENT
+    statuses = []
+    page = 1
 
-def ensure_watch_table(connection):
-    connection.execute("""
-        CREATE TABLE IF NOT EXISTS deployment_watch (
-            deployment_id INTEGER PRIMARY KEY,
-            deployment_json TEXT NOT NULL,
-            last_state TEXT,
-            checked_at TEXT NOT NULL
+    # RETRIEVE EVERY AVAILABLE STATUS PAGE
+    while True:
+
+        batch, metadata = list_deployment_statuses(
+            deployment_id=deployment_id,
+            per_page=100,
+            page=page,
         )
-        """)
 
+        # ACCUMULATE STATUSES FROM THE CURRENT PAGE
+        statuses.extend(batch)
 
-def table_exists(connection, table_name):
-    row = connection.execute(
-        """
-        SELECT 1
-        FROM sqlite_master
-        WHERE type = 'table' AND name = ?
-        """,
-        (table_name,),
-    ).fetchone()
+        # STOP WHEN NO NEXT PAGE EXISTS
+        if not metadata["has_next"]:
+            break
 
-    return row is not None
+        page += 1
 
-
-def load_watched_deployments(connection):
-    if not table_exists(connection, "deployment_watch"):
-        return {}
-
-    rows = connection.execute("""
-        SELECT deployment_id, deployment_json
-        FROM deployment_watch
-        """).fetchall()
-
-    watched = {}
-
-    for deployment_id, deployment_json in rows:
-        deployment = json.loads(deployment_json)
-
-        if deployment["id"] != deployment_id:
-            raise RuntimeError("Invalid deployment watch record")
-
-        watched[deployment_id] = deployment
-
-    return watched
-
-
-def remember_watched(connection, deployment, state, checked_at):
-    connection.execute(
-        """
-        INSERT INTO deployment_watch (
-            deployment_id,
-            deployment_json,
-            last_state,
-            checked_at
-        )
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(deployment_id)
-        DO UPDATE SET
-            deployment_json = excluded.deployment_json,
-            last_state = excluded.last_state,
-            checked_at = excluded.checked_at
-        """,
-        (
-            deployment["id"],
-            json.dumps(deployment, sort_keys=True),
-            state,
-            checked_at.isoformat(),
-        ),
-    )
-
-
-def forget_watched(connection, deployment_id):
-    connection.execute(
-        """
-        DELETE FROM deployment_watch
-        WHERE deployment_id = ?
-        """,
-        (deployment_id,),
-    )
+    return statuses
 
 
 def discover_deployments(start, scan_start):

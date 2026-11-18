@@ -2,33 +2,244 @@ import os
 from datetime import datetime, timedelta, timezone
 
 from github_client import (
-    github_get,
     get_headers,
+    get_workflow_run_attempt,
+    github_get,
+    list_workflow_run_jobs,
     list_workflow_runs,
 )
-from incremental_kafka_dry_run import parse_time
-from backfill_to_kafka import prepare_run_messages
 from kafka_producer import publish_messages
 from state import (
-    open_state,
-    needs_publishing,
-    remember_published,
-)
-from unfinished_runs import (
-    ensure_unfinished_table,
-    list_unfinished_run_ids,
-    remember_unfinished,
-    forget_unfinished,
-)
-from polling_state import (
     ensure_polling_table,
+    ensure_unfinished_table,
+    forget_unfinished,
     get_last_poll,
+    list_unfinished_run_ids,
+    needs_publishing,
+    open_state,
     record_successful_poll,
+    remember_published,
+    remember_unfinished,
 )
+from transform import parse_time, transform_build, transform_job
 
 STREAM = "workflows"
 OVERLAP = timedelta(minutes=15)
 LOOKBACK = timedelta(hours=48)
+
+
+def collect_one_day(target_date):
+
+    # CONVERT TARGET DATE TO ISO FORMAT FOR THE GITHUB QUERY
+    day = target_date.isoformat()
+
+    # BUILD THE GITHUB DATE-RANGE FILTER
+    created_filter = f"{day}..{day}"
+
+    # INITIALIZE PAGINATION STATE
+    all_runs = []
+    page = 1
+
+    print("=" * 60)
+    print("GITHUB HISTORICAL COLLECTION - ONE DAY")
+    print("=" * 60)
+    print(f"Target day (UTC): {day}")
+
+    # RETRIEVE PAGES OF WORKFLOW RUNS UNTIL NONE LEFT
+    while True:
+
+        data, metadata = list_workflow_runs(
+            per_page=100, page=page, created=created_filter
+        )
+
+        # TOTAL COUNT REPORTED BY GITHUB FOR THIS QUERY
+        total_count = data.get("total_count", 0)
+
+        # AVOID SILENTLY ACCEPTING GITHUB'S 1,000-RESULT CAP
+        if total_count >= 1000:
+            raise RuntimeError(
+                "Date window may exceed GitHub's 1,000-result "
+                "search limit. Split it into smaller time windows."
+            )
+
+        runs = data.get("workflow_runs", [])
+
+        # ACCUMULATE RUNS FROM THE CURRENT PAGE
+        all_runs.extend(runs)
+
+        print(
+            f"Page {page}: {len(runs)} runs | "
+            f"API remaining: {metadata['remaining']}"
+        )
+
+        # STOP WHEN NO RUNS RETURNED OR NO NEXT PAGE EXISTS
+        if not runs or not metadata["has_next"]:
+            break
+
+        page += 1
+
+    # CHECK RECORD UNIQUENESS
+    unique_ids = {run["id"] for run in all_runs}
+
+    print("\n" + "=" * 60)
+    print("HISTORICAL COLLECTION SUMMARY")
+    print("=" * 60)
+
+    print(f"GitHub reported: {total_count}")
+    print(f"Runs collected: {len(all_runs)}")
+    print(f"Unique run IDs: {len(unique_ids)}")
+
+    if len(unique_ids) != len(all_runs):
+        raise RuntimeError("Duplicate workflow run IDs detected.")
+
+    if len(all_runs) != total_count:
+        raise RuntimeError(
+            f"Incomplete collection: expected {total_count}, "
+            f"received {len(all_runs)}."
+        )
+
+    # COUNT WORKFLOW TYPES
+    workflow_counts = {}
+
+    for run in all_runs:
+        name = run.get("name") or "Unknown"
+
+        workflow_counts[name] = workflow_counts.get(name, 0) + 1
+
+    print("\nWorkflows found:")
+
+    for name, count in sorted(workflow_counts.items()):
+        print(f"{name}: {count}")
+
+    return all_runs
+
+
+def collect_jobs_for_run(run):
+
+    # ACCUMULATED TESTS MESSAGES FOR EVERY ATTEMPT
+    all_jobs = []
+
+    run_id = run["id"]
+    latest_attempt = run.get("run_attempt", 1)
+
+    # ITERATE OVER EVERY ATTEMPT OF THE RUN
+    for attempt in range(1, latest_attempt + 1):
+
+        page = 1
+
+        # RETRIEVE PAGES OF JOBS FOR THE CURRENT ATTEMPT
+        while True:
+
+            data, metadata = list_workflow_run_jobs(
+                run_id=run_id, attempt_number=attempt, per_page=100, page=page
+            )
+
+            jobs = data.get("jobs", [])
+
+            # TRANSFORM EACH JOB INTO A TESTS MESSAGE
+            for job in jobs:
+                message = transform_job(job, run, attempt_number=attempt)
+
+                all_jobs.append(message)
+
+            # STOP WHEN NO NEXT PAGE EXISTS
+            if not metadata["has_next"]:
+                break
+
+            page += 1
+
+    return all_jobs
+
+
+def prepare_run_messages(run):
+
+    # ACCUMULATED MESSAGES FOR THIS RUN (BUILDS + TESTS)
+    messages = []
+
+    run_id = run["id"]
+    latest_attempt = run.get("run_attempt") or 1
+
+    # BUILD MESSAGES FOR EVERY ATTEMPT
+    for attempt in range(1, latest_attempt + 1):
+
+        # THE LATEST ATTEMPT IS ALREADY IN THE RUN PAYLOAD
+        if attempt == latest_attempt:
+            attempt_run = run
+        else:
+            # OLDER ATTEMPTS NEED A SEPARATE API CALL
+            attempt_run, _ = get_workflow_run_attempt(run_id, attempt)
+
+        build = transform_build(attempt_run)
+        build["run_attempt"] = attempt
+
+        messages.append(("builds", f"{run_id}:{attempt}", build))
+
+    # JOB MESSAGES FOR EVERY ATTEMPT
+    jobs = collect_jobs_for_run(run)
+
+    for job in jobs:
+        messages.append(("tests", str(job["job_id"]), job))
+
+    return messages
+
+
+def backfill_day(target_date):
+    print("=" * 60)
+    print("CHECKPOINTED GITHUB -> KAFKA BACKFILL")
+    print("=" * 60)
+
+    # COLLECT ALL WORKFLOW RUNS FOR THE TARGET DAY
+    runs = collect_one_day(target_date)
+
+    # OPEN THE LOCAL CHECKPOINT DATABASE
+    connection = open_state()
+
+    delivered_count = 0
+    skipped_count = 0
+
+    try:
+
+        for index, run in enumerate(runs, start=1):
+
+            print(f"\n[{index}/{len(runs)}] " f"Run {run['id']}")
+
+            messages = prepare_run_messages(run)
+
+            # KEEP ONLY NEW OR CHANGED MESSAGES
+            pending = [
+                (topic, key, payload)
+                for topic, key, payload in messages
+                if needs_publishing(connection, topic, key, payload)
+            ]
+
+            skipped = len(messages) - len(pending)
+            skipped_count += skipped
+
+            if not pending:
+                print("No changes. Skipping.")
+                continue
+
+            # PUBLISH AND REQUIRE DELIVERY CONFIRMATION
+            publish_messages(pending)
+
+            # SAVE CHECKPOINTS ONLY AFTER SUCCESSFUL DELIVERY
+            remember_published(connection, pending)
+
+            delivered_count += len(pending)
+
+            print(f"Published: {len(pending)} | " f"Unchanged: {skipped}")
+
+        print("\n" + "=" * 60)
+        print("BACKFILL SUMMARY")
+        print("=" * 60)
+
+        print(f"Workflow runs: {len(runs)}")
+        print(f"Messages delivered: {delivered_count}")
+        print(f"Unchanged messages skipped: {skipped_count}")
+
+    finally:
+        # ALWAYS CLOSE THE CHECKPOINT CONNECTION
+        connection.close()
 
 
 def fetch_run_by_id(run_id):

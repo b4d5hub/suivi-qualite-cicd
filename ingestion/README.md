@@ -15,17 +15,16 @@ Ce module collecte des **données CI/CD réelles de GitHub Actions** depuis le d
 ## Fichiers du projet
 
 - `src/collector/github_client.py` — requêtes authentifiées à l'API GitHub, nouvelles tentatives après erreur et pagination.
+- `src/collector/workflows.py` — collecte des workflows, de leurs tentatives et de leurs jobs, en historique et en incrémental.
+- `src/collector/deployments.py` — collecte incrémentale des déploiements et récupération de l'historique des statuts.
 - `src/collector/transform.py` — transformation des réponses de l'API en événements.
 - `src/collector/kafka_producer.py` — envoi des messages à Kafka et vérification des accusés de réception.
-- `src/collector/state.py` — suivi des événements publiés et déduplication des charges utiles avec SQLite.
+- `src/collector/state.py` — état SQLite des publications, points de reprise, workflows inachevés et déploiements surveillés.
 - `src/collector/backfill_batches.py` — pilotage du rattrapage historique des workflows par lots.
 - `src/collector/backfill_deployments.py` — collecte historique des déploiements.
-- `src/collector/incremental_to_kafka.py` — collecte incrémentale des workflows et des jobs.
-- `src/collector/incremental_deployments_to_kafka.py` — collecte incrémentale des déploiements.
-- `src/collector/polling_state.py` — gestion des points de reprise (watermarks) persistants.
-- `src/collector/unfinished_runs.py` — suivi des workflows jusqu'à leur achèvement.
 - `src/collector/poll_lock.py` — verrou local empêchant deux cycles de collecte simultanés.
 - `src/collector/poll_once.py` — point d'entrée pour un cycle complet de collecte incrémentale.
+- `tools/` — scripts de diagnostic, de prévisualisation et de démonstration à lancer depuis la racine du dépôt.
 - `compose.kafka.yml` — environnement Kafka local.
 
 ## Installation (Windows PowerShell)

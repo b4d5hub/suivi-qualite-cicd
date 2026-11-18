@@ -1,3 +1,5 @@
+import _collector_path
+
 import requests
 
 from github_client import list_workflow_runs, list_workflow_run_jobs

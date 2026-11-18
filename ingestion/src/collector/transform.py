@@ -1,6 +1,10 @@
 from datetime import datetime
 
 
+def parse_time(value):
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
 def calculate_duration(started_at, completed_at):
 
     # RETURN NONE IF EITHER TIMESTAMP IS MISSING
@@ -8,9 +12,9 @@ def calculate_duration(started_at, completed_at):
         return None
 
     # PARSE ISO 8601 TIMESTAMPS (NORMALIZE "Z" TO "+00:00")
-    start = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+    start = parse_time(started_at)
 
-    end = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
+    end = parse_time(completed_at)
 
     # COMPUTE DURATION IN SECONDS
     duration = (end - start).total_seconds()

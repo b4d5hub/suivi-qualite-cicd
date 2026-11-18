@@ -1,47 +1,10 @@
+import _collector_path
+
 from datetime import datetime, timedelta, timezone
 
 import requests
 
-from backfill_preview import collect_one_day
-from github_client import list_workflow_run_jobs
-from transform import transform_job
-
-
-def collect_jobs_for_run(run):
-
-    # ACCUMULATED TESTS MESSAGES FOR EVERY ATTEMPT
-    all_jobs = []
-
-    run_id = run["id"]
-    latest_attempt = run.get("run_attempt", 1)
-
-    # ITERATE OVER EVERY ATTEMPT OF THE RUN
-    for attempt in range(1, latest_attempt + 1):
-
-        page = 1
-
-        # RETRIEVE PAGES OF JOBS FOR THE CURRENT ATTEMPT
-        while True:
-
-            data, metadata = list_workflow_run_jobs(
-                run_id=run_id, attempt_number=attempt, per_page=100, page=page
-            )
-
-            jobs = data.get("jobs", [])
-
-            # TRANSFORM EACH JOB INTO A TESTS MESSAGE
-            for job in jobs:
-                message = transform_job(job, run, attempt_number=attempt)
-
-                all_jobs.append(message)
-
-            # STOP WHEN NO NEXT PAGE EXISTS
-            if not metadata["has_next"]:
-                break
-
-            page += 1
-
-    return all_jobs
+from workflows import collect_jobs_for_run, collect_one_day
 
 
 def main():
