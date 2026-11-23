@@ -17,18 +17,20 @@ lakehouse/
 ├── .env.example              # Safe development defaults for MinIO, Kafka, and bucket name
 ├── README.md                 # Architecture, data contracts, checklist, and run guide
 ├── VERSIONS.md               # Pinned versions for Spark, Hudi, Hadoop-AWS, MinIO, and known risks
-├── compose.lakehouse.yml     # (Planned) Docker Compose for MinIO, bucket init, and Spark container
+├── compose.lakehouse.yml     # Docker Compose for MinIO (cicd-lakehouse) and Spark 3.5.1 container
+├── submit.sh                 # Central spark-submit wrapper with Maven packages and local[2] settings
 ├── run_all.sh                # (Planned) Helper script to run Bronze + Silver + verification
-├── src/                      # (Planned) PySpark jobs and shared modules
-│   ├── config.py             # Environment settings and S3A/Hudi options
-│   ├── spark_session.py      # SparkSession builder with Kryo, Hudi, and S3A config
-│   ├── schemas.py            # Explicit PySpark StructType schemas for Kafka JSON payloads
-│   ├── bronze_ingest.py      # Kafka -> MinIO Bronze Structured Streaming job
-│   ├── silver_builds.py      # Bronze -> Hudi silver_builds upsert job
-│   ├── silver_tests.py       # Bronze -> Hudi silver_tests upsert job
-│   └── silver_deployments.py # Bronze -> Hudi silver_deployments upsert job
-└── tools/                    # (Planned) Verification and diagnostic scripts
-    └── verify_lakehouse.py   # Validates row counts and proves zero duplicates after re-runs
+├── src/                      # PySpark jobs and shared modules
+│   ├── config.py             # Environment settings and S3A/checkpoint/table path helpers
+│   ├── spark_session.py      # SparkSession builder with Kryo, Hudi 0.15, and MinIO S3A config
+│   ├── schemas.py            # (Planned) Explicit PySpark StructType schemas for Kafka JSON payloads
+│   ├── bronze_ingest.py      # (Planned) Kafka -> MinIO Bronze Structured Streaming job
+│   ├── silver_builds.py      # (Planned) Bronze -> Hudi silver_builds upsert job
+│   ├── silver_tests.py       # (Planned) Bronze -> Hudi silver_tests upsert job
+│   └── silver_deployments.py # (Planned) Bronze -> Hudi silver_deployments upsert job
+└── tools/                    # Verification and diagnostic scripts
+    ├── smoke_test.py         # Verifies S3A Parquet round trip, Kafka counts, and Hudi COW upsert
+    └── verify_lakehouse.py   # (Planned) Validates row counts and proves zero duplicates after re-runs
 ```
 
 ---
@@ -65,9 +67,9 @@ lakehouse/
 
 - [x] Foundation of `lakehouse/` (`.gitignore`, folders, `VERSIONS.md`, `.env.example`, `README.md`)
 - [x] MinIO service (`lakehouse-minio`) with automatic `cicd-lakehouse` bucket creation on `ingestion_default`
-- [ ] Spark container in `compose.lakehouse.yml`
-- [ ] Verify Kafka network and historical snapshot data (`30,494` records)
-- [ ] Shared configuration and `SparkSession` builder (`config.py`, `spark_session.py`)
+- [x] Spark container (`apache/spark:3.5.1-scala2.12-java17-python3-ubuntu`) and `submit.sh` in `compose.lakehouse.yml`
+- [x] Verify Kafka network and historical snapshot data (`7,441` / `22,747` / `306` records via `tools/smoke_test.py`)
+- [x] Shared configuration and `SparkSession` builder (`config.py`, `spark_session.py`)
 - [ ] Explicit PySpark JSON schemas (`schemas.py`)
 - [ ] Kafka -> MinIO Bronze Structured Streaming job (`bronze_ingest.py`)
 - [ ] Bronze -> Hudi `silver_builds` upsert job (`silver_builds.py`)
@@ -90,6 +92,16 @@ Invoke-WebRequest -UseBasicParsing http://localhost:9100/minio/health/live
 - **Internal Docker S3 Endpoint (for Spark)**: `http://minio:9000`
 - **Host S3 API**: `http://localhost:9100` (mapped to `9100` to avoid conflicts with other projects using `9000`)
 - **Host Web Console**: `http://localhost:9101`
+
+---
+
+## Run Smoke Test (S3A + Kafka + Hudi)
+
+Run the one-shot Spark container against MinIO (`http://minio:9000`) and Kafka (`kafka:19092`):
+
+```powershell
+docker compose -f lakehouse/compose.lakehouse.yml run --rm spark tools/smoke_test.py
+```
 
 ---
 
