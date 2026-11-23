@@ -24,13 +24,14 @@ lakehouse/
 │   ├── config.py             # Environment settings and S3A/checkpoint/table path helpers
 │   ├── spark_session.py      # SparkSession builder with Kryo, Hudi 0.15, and MinIO S3A config
 │   ├── schemas.py            # Explicit PySpark StructType schemas for Kafka JSON payloads
-│   ├── bronze_ingest.py      # (Planned) Kafka -> MinIO Bronze Structured Streaming job
+│   ├── bronze_ingest.py      # Kafka -> MinIO Bronze Structured Streaming job
 │   ├── silver_builds.py      # (Planned) Bronze -> Hudi silver_builds upsert job
 │   ├── silver_tests.py       # (Planned) Bronze -> Hudi silver_tests upsert job
 │   └── silver_deployments.py # (Planned) Bronze -> Hudi silver_deployments upsert job
 └── tools/                    # Verification and diagnostic scripts
     ├── smoke_test.py         # Verifies S3A Parquet round trip, Kafka counts, and Hudi COW upsert
     ├── check_contract.py     # Verifies Kafka data contract (schemas, keys, nulls, timestamps, distributions)
+    ├── verify_bronze.py      # Verifies Bronze Parquet tables, contiguous offsets, and byte-identical Kafka raw proof
     └── verify_lakehouse.py   # (Planned) Validates row counts and proves zero duplicates after re-runs
 ```
 
@@ -72,7 +73,7 @@ lakehouse/
 - [x] Verify Kafka network and historical snapshot data (`7,441` / `22,747` / `306` records via `tools/smoke_test.py`)
 - [x] Shared configuration and `SparkSession` builder (`config.py`, `spark_session.py`)
 - [x] Explicit PySpark JSON schemas and data-contract check (`schemas.py`, `tools/check_contract.py`)
-- [ ] Kafka -> MinIO Bronze Structured Streaming job (`bronze_ingest.py`)
+- [x] Kafka -> MinIO Bronze Structured Streaming job and verification (`src/bronze_ingest.py`, `tools/verify_bronze.py`)
 - [ ] Bronze -> Hudi `silver_builds` upsert job (`silver_builds.py`)
 - [ ] Bronze -> Hudi `silver_tests` and `silver_deployments` upsert jobs (`silver_tests.py`, `silver_deployments.py`)
 - [ ] End-to-end verification script (`verify_lakehouse.py`), idempotency proof, and final run documentation
@@ -127,6 +128,36 @@ docker compose -f lakehouse/compose.lakehouse.yml run --rm spark tools/check_con
 - **`deployments` Environments & `was_successful`**:
   - `production_environment` is `False` for all `306 / 306` records; environment filtering must use `environment` (`stg-clients=144`, `prd-clients=134`, `stg-api=13`, `prd-api=12` distinct keys; `prd-api=15` in raw records).
   - `latest_status` is mostly `inactive=262` (`success=42` raw / `39` distinct, `failure=2`), whereas deriving `was_successful` from `status_history` recovers `True=301` successful deployments and `False=2` failed deployments out of `303` distinct deployments.
+
+---
+
+## Run Bronze Ingestion & Verification (Kafka -> MinIO Parquet)
+
+Stream all 3 topics (`builds`, `tests`, `deployments`) sequentially from Kafka (`startingOffsets=earliest`, `trigger(availableNow=True)`) into `s3a://cicd-lakehouse/bronze/<topic>/` with per-topic checkpoints at `s3a://cicd-lakehouse/_checkpoints/bronze/<topic>/`:
+
+```powershell
+# 1. Run Bronze Structured Streaming ingestion
+docker compose -f lakehouse/compose.lakehouse.yml run --rm spark src/bronze_ingest.py
+
+# 2. Run Bronze verification (columns, counts, offsets, byte-identical Kafka raw proof, schema parse)
+docker compose -f lakehouse/compose.lakehouse.yml run --rm spark tools/verify_bronze.py
+
+# 3. Inspect Bronze directories and size in MinIO
+docker exec lakehouse-minio ls /data/cicd-lakehouse/bronze
+docker exec lakehouse-minio du -sh /data/cicd-lakehouse
+```
+
+### Bronze Reset Procedure (Documentation Only — Do Not Run Unnecessarily)
+
+Because the Bronze layer is **append-only Parquet** and Spark Structured Streaming tracks consumed Kafka offsets in its checkpoint folder (`s3a://cicd-lakehouse/_checkpoints/bronze/<topic>/`), **a Bronze data folder and its checkpoint folder are a linked pair**:
+
+- If you delete only `_checkpoints/bronze/<topic>/` while leaving `bronze/<topic>/` in place, the next run of `src/bronze_ingest.py` will start from `earliest` again and **append duplicate rows** into Bronze (which Silver Hudi upserts would later deduplicate, but Bronze row counts would double).
+- If you delete only `bronze/<topic>/` while leaving `_checkpoints/bronze/<topic>/` in place, Spark will think all offsets were already ingested and write `0` rows.
+- **Correct way to reset a Bronze topic (if ever needed)**: Always remove **both** the data directory and the checkpoint directory together before re-running `src/bronze_ingest.py`:
+  ```powershell
+  # Example only (do NOT run during normal operation):
+  # docker exec lakehouse-minio rm -rf /data/cicd-lakehouse/bronze/<topic> /data/cicd-lakehouse/_checkpoints/bronze/<topic>
+  ```
 
 ---
 
