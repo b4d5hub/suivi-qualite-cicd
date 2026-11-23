@@ -23,13 +23,14 @@ lakehouse/
 ├── src/                      # PySpark jobs and shared modules
 │   ├── config.py             # Environment settings and S3A/checkpoint/table path helpers
 │   ├── spark_session.py      # SparkSession builder with Kryo, Hudi 0.15, and MinIO S3A config
-│   ├── schemas.py            # (Planned) Explicit PySpark StructType schemas for Kafka JSON payloads
+│   ├── schemas.py            # Explicit PySpark StructType schemas for Kafka JSON payloads
 │   ├── bronze_ingest.py      # (Planned) Kafka -> MinIO Bronze Structured Streaming job
 │   ├── silver_builds.py      # (Planned) Bronze -> Hudi silver_builds upsert job
 │   ├── silver_tests.py       # (Planned) Bronze -> Hudi silver_tests upsert job
 │   └── silver_deployments.py # (Planned) Bronze -> Hudi silver_deployments upsert job
 └── tools/                    # Verification and diagnostic scripts
     ├── smoke_test.py         # Verifies S3A Parquet round trip, Kafka counts, and Hudi COW upsert
+    ├── check_contract.py     # Verifies Kafka data contract (schemas, keys, nulls, timestamps, distributions)
     └── verify_lakehouse.py   # (Planned) Validates row counts and proves zero duplicates after re-runs
 ```
 
@@ -70,7 +71,7 @@ lakehouse/
 - [x] Spark container (`apache/spark:3.5.1-scala2.12-java17-python3-ubuntu`) and `submit.sh` in `compose.lakehouse.yml`
 - [x] Verify Kafka network and historical snapshot data (`7,441` / `22,747` / `306` records via `tools/smoke_test.py`)
 - [x] Shared configuration and `SparkSession` builder (`config.py`, `spark_session.py`)
-- [ ] Explicit PySpark JSON schemas (`schemas.py`)
+- [x] Explicit PySpark JSON schemas and data-contract check (`schemas.py`, `tools/check_contract.py`)
 - [ ] Kafka -> MinIO Bronze Structured Streaming job (`bronze_ingest.py`)
 - [ ] Bronze -> Hudi `silver_builds` upsert job (`silver_builds.py`)
 - [ ] Bronze -> Hudi `silver_tests` and `silver_deployments` upsert jobs (`silver_tests.py`, `silver_deployments.py`)
@@ -102,6 +103,30 @@ Run the one-shot Spark container against MinIO (`http://minio:9000`) and Kafka (
 ```powershell
 docker compose -f lakehouse/compose.lakehouse.yml run --rm spark tools/smoke_test.py
 ```
+
+---
+
+## Run Data-Contract Verification (Read-Only on Kafka)
+
+Validate all 30,494 Kafka messages against `src/schemas.py`:
+
+```powershell
+docker compose -f lakehouse/compose.lakehouse.yml run --rm spark tools/check_contract.py
+```
+
+### Data Contract Findings (Verified on Snapshot)
+
+- **100% Schema & Key Match**: Every message across `builds` (`7,441`), `tests` (`22,747`), and `deployments` (`306`) parses cleanly with `0` null structs, `0` key mismatches, `0` extra/missing JSON fields, and `0` timestamp format violations (`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$`).
+- **Duplicate Keys in Snapshot**: There are exactly 3 extra records per topic (`7,441 -> 7,438`, `22,747 -> 22,744`, `306 -> 303`). In `builds`, key `44069120063:1` appears `4` times (accounting for the 3 duplicates).
+- **`builds` Conclusions & `duration_s`**:
+  - Across all `7,441` records: `success=5,860`, `failure=808`, `cancelled=561`, `action_required=207`, `startup_failure=5` (after deduplicating to `7,438` keys: `success=5,857`). All `7,441` records have `status='completed'`.
+  - `builds.duration_s` is `null` in all `7,441 / 7,441` rows (`100%` null) and must be computed in Silver from `updated_at - started_at`.
+- **`tests` Conclusions & `duration_s`**:
+  - Across all `22,747` records: `success=17,493`, `skipped=3,654`, `cancelled=951`, `failure=649` (after deduplicating to `22,744` keys: `success=17,490`).
+  - `tests.duration_s` is `null` in `3,794 / 22,747` rows (`3,654` skipped jobs + `140` cancelled jobs that never started or had a zero/missing duration) and populated in `18,953` rows.
+- **`deployments` Environments & `was_successful`**:
+  - `production_environment` is `False` for all `306 / 306` records; environment filtering must use `environment` (`stg-clients=144`, `prd-clients=134`, `stg-api=13`, `prd-api=12` distinct keys; `prd-api=15` in raw records).
+  - `latest_status` is mostly `inactive=262` (`success=42` raw / `39` distinct, `failure=2`), whereas deriving `was_successful` from `status_history` recovers `True=301` successful deployments and `False=2` failed deployments out of `303` distinct deployments.
 
 ---
 
