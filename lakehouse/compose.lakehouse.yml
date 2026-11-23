@@ -1,0 +1,35 @@
+services:
+  minio:
+    image: minio/minio:RELEASE.2024-01-16T16-07-38Z
+    container_name: lakehouse-minio
+    hostname: minio
+    # Create the cicd-lakehouse bucket folder in single-drive mode before starting MinIO
+    entrypoint:
+      - sh
+      - -c
+      - "mkdir -p /data/cicd-lakehouse && exec minio server /data --console-address ':9001'"
+    ports:
+      # Host ports 9100/9101 avoid conflicts with unrelated minio_prod container on 9000/9001
+      - "127.0.0.1:9100:9000"
+      - "127.0.0.1:9101:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - lakehouse_minio_data:/data
+    mem_limit: 512m
+    healthcheck:
+      # mc is built into minio/minio:RELEASE.2024-01-16T16-07-38Z (/usr/bin/mc)
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  lakehouse_minio_data:
+
+networks:
+  default:
+    name: ${KAFKA_NETWORK:-ingestion_default}
+    external: true

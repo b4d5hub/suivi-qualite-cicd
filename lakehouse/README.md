@@ -63,8 +63,9 @@ lakehouse/
 
 ## Task Checklist
 
-- [ ] Foundation of `lakehouse/` (`.gitignore`, folders, `VERSIONS.md`, `.env.example`, `README.md`)
-- [ ] Docker Compose for MinIO, automatic `cicd-lakehouse` bucket creation, and Spark container
+- [x] Foundation of `lakehouse/` (`.gitignore`, folders, `VERSIONS.md`, `.env.example`, `README.md`)
+- [x] MinIO service (`lakehouse-minio`) with automatic `cicd-lakehouse` bucket creation on `ingestion_default`
+- [ ] Spark container in `compose.lakehouse.yml`
 - [ ] Verify Kafka network and historical snapshot data (`30,494` records)
 - [ ] Shared configuration and `SparkSession` builder (`config.py`, `spark_session.py`)
 - [ ] Explicit PySpark JSON schemas (`schemas.py`)
@@ -72,6 +73,23 @@ lakehouse/
 - [ ] Bronze -> Hudi `silver_builds` upsert job (`silver_builds.py`)
 - [ ] Bronze -> Hudi `silver_tests` and `silver_deployments` upsert jobs (`silver_tests.py`, `silver_deployments.py`)
 - [ ] End-to-end verification script (`verify_lakehouse.py`), idempotency proof, and final run documentation
+
+---
+
+## Start MinIO
+
+With the Kafka stack's network (`ingestion_default`) already present, start the Lakehouse MinIO service from the repository root:
+
+```powershell
+docker compose -f lakehouse/compose.lakehouse.yml up -d minio
+docker ps --filter "name=lakehouse-minio"
+docker exec lakehouse-minio ls /data
+Invoke-WebRequest -UseBasicParsing http://localhost:9100/minio/health/live
+```
+
+- **Internal Docker S3 Endpoint (for Spark)**: `http://minio:9000`
+- **Host S3 API**: `http://localhost:9100` (mapped to `9100` to avoid conflicts with other projects using `9000`)
+- **Host Web Console**: `http://localhost:9101`
 
 ---
 
