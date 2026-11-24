@@ -25,8 +25,9 @@ lakehouse/
 │   ├── spark_session.py      # SparkSession builder with Kryo, Hudi 0.15, and MinIO S3A config
 │   ├── schemas.py            # Explicit PySpark StructType schemas for Kafka JSON payloads
 │   ├── bronze_ingest.py      # Kafka -> MinIO Bronze Structured Streaming job
+│   ├── silver_common.py      # Shared UTC timestamp cast, batch deduplication, and Hudi options
 │   ├── silver_builds.py      # Bronze -> Hudi silver_builds upsert job
-│   ├── silver_tests.py       # (Planned) Bronze -> Hudi silver_tests upsert job
+│   ├── silver_tests.py       # Bronze -> Hudi silver_tests upsert job
 │   └── silver_deployments.py # (Planned) Bronze -> Hudi silver_deployments upsert job
 └── tools/                    # Verification and diagnostic scripts
     ├── smoke_test.py         # Verifies S3A Parquet round trip, Kafka counts, and Hudi COW upsert
@@ -76,7 +77,8 @@ lakehouse/
 - [x] Explicit PySpark JSON schemas and data-contract check (`schemas.py`, `tools/check_contract.py`)
 - [x] Kafka -> MinIO Bronze Structured Streaming job and verification (`src/bronze_ingest.py`, `tools/verify_bronze.py`)
 - [x] Bronze -> Hudi `silver_builds` upsert job and verification (`src/silver_builds.py`, `tools/verify_silver.py silver_builds`)
-- [ ] Bronze -> Hudi `silver_tests` and `silver_deployments` upsert jobs (`silver_tests.py`, `silver_deployments.py`)
+- [x] Bronze -> Hudi `silver_tests` upsert job and verification (`src/silver_tests.py`, `tools/verify_silver.py silver_tests`)
+- [ ] Bronze -> Hudi `silver_deployments` upsert job (`silver_deployments.py`)
 - [ ] End-to-end verification script (`verify_lakehouse.py`), idempotency proof, and final run documentation
 
 ---
@@ -208,8 +210,63 @@ docker exec lakehouse-minio sh -c "mc alias set local http://localhost:9000 mini
 | 14 | `source_kafka_offset` | `LongType` | Yes | Traceability: Kafka offset of the winning Bronze message. |
 
 > [!WARNING]
-> **Important Note for Gold Success-Rate & MLlib Queries (Kamal)**:
-> All `7,438` rows in `silver_builds` have `status = 'completed'`, **but not all completed runs are successes or failures**. Specifically, `conclusion` can be `'cancelled'` (`561` rows), `'action_required'` (`207` rows), or `'startup_failure'` (`5` rows). Per the Cahier des Charges (Section 8: `Taux de réussite = Runs réussis / (runs réussis + runs en échec)`), **do NOT count `'cancelled'`, `'action_required'`, or `'startup_failure'` as either `success` or `failure`** when computing build success rates or training binary classification labels (`conclusion IN ('success', 'failure')`).
+> **Important Notes for Gold Success-Rate, Duration & MLlib Queries (Kamal)**:
+> 1. **Conclusions**: All `7,438` rows in `silver_builds` have `status = 'completed'`, **but not all completed runs are successes or failures**. Specifically, `conclusion` can be `'cancelled'` (`561` rows), `'action_required'` (`207` rows), or `'startup_failure'` (`5` rows). Per the Cahier des Charges (Section 8: `Taux de réussite = Runs réussis / (runs réussis + runs en échec)`), **do NOT count `'cancelled'`, `'action_required'`, or `'startup_failure'` as either `success` or `failure`** when computing build success rates or training binary classification labels (`conclusion IN ('success', 'failure')`).
+> 2. **Extreme Outliers in `duration_s` (Use the Median / Filter Outliers)**: Because GitHub's workflow run object does not provide an explicit `completed_at` timestamp, `duration_s = updated_at - started_at` reflects the last time the run object was touched on GitHub (for example, when old artifacts expire or a run is re-evaluated weeks later). In the snapshot, **p50 (median) is `61s` (~1 min)** and **p90 is `2,139s` (~35.6 min)**, while **p99 is `83,540s`** (`75` runs exceed 24 hours, up to ~30 days / `2,595,846s`, yielding a skewed mean of `12,587.64s`). Use the **median (`percentile_approx(duration_s, 0.5)`)** or cap/filter extreme outliers (`duration_s <= 86400`), or aggregate job durations from `silver_tests`.
+
+---
+
+## Run Silver `silver_tests` Job & Verification (Bronze -> Hudi COPY_ON_WRITE)
+
+Read `s3a://cicd-lakehouse/bronze/tests/`, cast UTC timestamps, keep `duration_s` untouched as computed by the collector, compute `event_ts = coalesce(completed_at, started_at)`, deduplicate by `job_id` ordering by `(event_ts DESC, source_kafka_offset DESC)`, and upsert into `s3a://cicd-lakehouse/silver/silver_tests`:
+
+```powershell
+# 1. Run silver_tests Hudi upsert job
+docker compose -f lakehouse/compose.lakehouse.yml run --rm spark src/silver_tests.py
+
+# 2. Verify silver_tests (schema, 22,744 rows, job_id 133990467008, duration consistency, Bronze equivalence, silver_builds integrity)
+docker compose -f lakehouse/compose.lakehouse.yml run --rm spark tools/verify_silver.py silver_tests
+
+# 3. Inspect Hudi table properties in MinIO
+docker exec lakehouse-minio ls /data/cicd-lakehouse/silver
+docker exec lakehouse-minio sh -c "mc alias set local http://localhost:9000 minioadmin minioadmin >/dev/null && mc cat local/cicd-lakehouse/silver/silver_tests/.hoodie/hoodie.properties"
+```
+
+### Silver Contract: `silver_tests` (Handover Reference for Kamal — Flaky Jobs & Gold)
+
+- **What a Row Represents**: Each row in `silver_tests` is a **GitHub Actions Job** (e.g., `'Build E2E API (Container)'`, `'Test - i18n'`, `'Lint (24)'`, `'triage'`), **not an individual unit test case**. There are `73` distinct `job_name` values across `22,744` jobs, and `100%` of `(run_id, run_attempt)` pairs (`0` orphans) join cleanly to `silver_builds`.
+- **MinIO S3A Path**: `s3a://cicd-lakehouse/silver/silver_tests`
+- **Hudi Table Configuration**:
+  - `hoodie.table.name`: `silver_tests`
+  - `hoodie.datasource.write.table.type`: `COPY_ON_WRITE`
+  - `hoodie.datasource.write.operation`: `upsert`
+  - `hoodie.datasource.write.recordkey.field`: `job_id` (using `org.apache.hudi.keygen.NonpartitionedKeyGenerator`)
+  - `hoodie.datasource.write.precombine.field`: `event_ts` (`coalesce(completed_at, started_at)`)
+  - `hoodie.metadata.enable`: `false`
+
+| # | Column | Spark Type | Nullable | Description / Contract Notes |
+| :- | :--- | :--- | :--- | :--- |
+| 1 | `job_id` | `LongType` | No | GitHub Actions job ID (Hudi `recordkey`; `22,744` distinct rows). |
+| 2 | `run_id` | `LongType` | No | Foreign key to `silver_builds.run_id`. |
+| 3 | `run_attempt` | `IntegerType` | No | Foreign key to `silver_builds.run_attempt` (`0` orphan rows when joining on `run_id, run_attempt`). |
+| 4 | `head_sha` | `StringType` | Yes | Commit SHA tested by this job (used for flaky-job detection across runs on the same commit). |
+| 5 | `job_name` | `StringType` | Yes | Name of the GitHub Actions job (`73` distinct names). |
+| 6 | `status` | `StringType` | No | Execution state (`"completed"`, `"in_progress"`). |
+| 7 | `conclusion` | `StringType` | Yes | Final outcome: `"success"` (`17,490`), `"skipped"` (`3,654`), `"cancelled"` (`951`), `"failure"` (`649`). |
+| 8 | `started_at` | `TimestampType` | Yes | UTC timestamp when the job started. |
+| 9 | `completed_at` | `TimestampType` | Yes | UTC timestamp when the job completed. |
+| 10 | `duration_s` | `LongType` | Yes | Exact job duration in seconds (`completed_at - started_at`) delivered by the collector (`18,950` non-null rows, `3,794` null rows, `0` negative values). |
+| 11 | `event_ts` | `TimestampType` | No | `coalesce(completed_at, started_at)` — non-null ordering timestamp used as Hudi `precombine` field. |
+| 12 | `source_kafka_partition` | `IntegerType` | Yes | Traceability: Kafka partition (`0`) of the winning Bronze message. |
+| 13 | `source_kafka_offset` | `LongType` | Yes | Traceability: Kafka offset of the winning Bronze message. |
+
+> [!NOTE]
+> **How to Handle `NULL` `duration_s` in `silver_tests` (`3,794` rows)**:
+> `duration_s` is kept exactly as computed by Badr's collector (`transform.py`) and is `NULL` in three exact cases verified on the snapshot:
+> 1. `status = 'completed'` and `conclusion = 'skipped'` (**`3,654` rows**): skipped jobs never ran (`transform.py` intentionally sets `duration_s = None`).
+> 2. `status = 'completed'` and `conclusion = 'cancelled'` (**`138` rows**): aborted jobs where GitHub recorded `completed_at` 1 second before `started_at` (`completed_at < started_at`, clock skew on instant cancellation), which `transform.py` rejected (`duration < 0 -> None`).
+> 3. `status = 'in_progress'` and `conclusion = 'success'` (**`2` rows**): jobs captured while `status` had not yet flipped to `'completed'`.
+> When computing average/total job execution time in Gold, filter with `WHERE duration_s IS NOT NULL` (or `WHERE status = 'completed' AND conclusion IN ('success', 'failure')`).
 
 ---
 
