@@ -28,7 +28,7 @@ lakehouse/
 │   ├── silver_common.py      # Shared UTC timestamp cast, batch deduplication, and Hudi options
 │   ├── silver_builds.py      # Bronze -> Hudi silver_builds upsert job
 │   ├── silver_tests.py       # Bronze -> Hudi silver_tests upsert job
-│   └── silver_deployments.py # (Planned) Bronze -> Hudi silver_deployments upsert job
+│   └── silver_deployments.py # Bronze -> Hudi silver_deployments upsert job
 └── tools/                    # Verification and diagnostic scripts
     ├── smoke_test.py         # Verifies S3A Parquet round trip, Kafka counts, and Hudi COW upsert
     ├── check_contract.py     # Verifies Kafka data contract (schemas, keys, nulls, timestamps, distributions)
@@ -78,7 +78,7 @@ lakehouse/
 - [x] Kafka -> MinIO Bronze Structured Streaming job and verification (`src/bronze_ingest.py`, `tools/verify_bronze.py`)
 - [x] Bronze -> Hudi `silver_builds` upsert job and verification (`src/silver_builds.py`, `tools/verify_silver.py silver_builds`)
 - [x] Bronze -> Hudi `silver_tests` upsert job and verification (`src/silver_tests.py`, `tools/verify_silver.py silver_tests`)
-- [ ] Bronze -> Hudi `silver_deployments` upsert job (`silver_deployments.py`)
+- [x] Bronze -> Hudi `silver_deployments` upsert job and verification (`src/silver_deployments.py`, `tools/verify_silver.py silver_deployments`)
 - [ ] End-to-end verification script (`verify_lakehouse.py`), idempotency proof, and final run documentation
 
 ---
@@ -267,6 +267,64 @@ docker exec lakehouse-minio sh -c "mc alias set local http://localhost:9000 mini
 > 2. `status = 'completed'` and `conclusion = 'cancelled'` (**`138` rows**): aborted jobs where GitHub recorded `completed_at` 1 second before `started_at` (`completed_at < started_at`, clock skew on instant cancellation), which `transform.py` rejected (`duration < 0 -> None`).
 > 3. `status = 'in_progress'` and `conclusion = 'success'` (**`2` rows**): jobs captured while `status` had not yet flipped to `'completed'`.
 > When computing average/total job execution time in Gold, filter with `WHERE duration_s IS NOT NULL` (or `WHERE status = 'completed' AND conclusion IN ('success', 'failure')`).
+
+---
+
+## Run Silver `silver_deployments` Job & Verification (Bronze -> Hudi COPY_ON_WRITE)
+
+Read `s3a://cicd-lakehouse/bronze/deployments/`, cast top-level and nested `status_history[].created_at` UTC timestamps, derive `was_successful`, `first_success_at`, `is_prd_environment`, and `event_ts = coalesce(latest_status_at, updated_at, created_at)`, deduplicate by `deployment_id` ordering by `(event_ts DESC, source_kafka_offset DESC)`, and upsert into `s3a://cicd-lakehouse/silver/silver_deployments`:
+
+```powershell
+# 1. Run silver_deployments Hudi upsert job
+docker compose -f lakehouse/compose.lakehouse.yml run --rm spark src/silver_deployments.py
+
+# 2. Verify silver_deployments (or verify all 3 Silver tables in one run)
+docker compose -f lakehouse/compose.lakehouse.yml run --rm spark tools/verify_silver.py silver_deployments
+docker compose -f lakehouse/compose.lakehouse.yml run --rm spark tools/verify_silver.py silver_builds silver_tests silver_deployments
+
+# 3. Inspect Hudi table properties in MinIO
+docker exec lakehouse-minio ls /data/cicd-lakehouse/silver
+docker exec lakehouse-minio sh -c "mc alias set local http://localhost:9000 minioadmin minioadmin >/dev/null && mc cat local/cicd-lakehouse/silver/silver_deployments/.hoodie/hoodie.properties"
+```
+
+### Silver Contract: `silver_deployments` (Handover Reference for Kamal — DORA Metrics & Gold)
+
+- **MinIO S3A Path**: `s3a://cicd-lakehouse/silver/silver_deployments`
+- **Hudi Table Configuration**:
+  - `hoodie.table.name`: `silver_deployments`
+  - `hoodie.datasource.write.table.type`: `COPY_ON_WRITE`
+  - `hoodie.datasource.write.operation`: `upsert`
+  - `hoodie.datasource.write.recordkey.field`: `deployment_id` (using `org.apache.hudi.keygen.NonpartitionedKeyGenerator`)
+  - `hoodie.datasource.write.precombine.field`: `event_ts` (`coalesce(latest_status_at, updated_at, created_at)`)
+  - `hoodie.metadata.enable`: `false`
+
+| # | Column | Spark Type | Nullable | Description / Contract Notes |
+| :- | :--- | :--- | :--- | :--- |
+| 1 | `deployment_id` | `LongType` | No | GitHub deployment ID (Hudi `recordkey`; `303` distinct rows). |
+| 2 | `environment` | `StringType` | No | Target deployment environment: `'stg-clients'` (`144`), `'prd-clients'` (`134`), `'stg-api'` (`13`), `'prd-api'` (`12`). |
+| 3 | `production_environment` | `BooleanType` | Yes | Raw GitHub flag preserved as delivered (`False` for all `303` rows — see warning below). |
+| 4 | `ref` | `StringType` | Yes | Git ref deployed (e.g., branch or tag). |
+| 5 | `sha` | `StringType` | Yes | 40-char lowercase hex commit SHA deployed (`0` nulls, `13` distinct commits across the `303` deployments). |
+| 6 | `created_at` | `TimestampType` | No | UTC timestamp when the deployment record was created. |
+| 7 | `updated_at` | `TimestampType` | Yes | UTC timestamp when the deployment record was last updated. |
+| 8 | `latest_status` | `StringType` | Yes | State of the most recent status entry: `'inactive'` (`262`), `'success'` (`39`), `'failure'` (`2`). |
+| 9 | `latest_status_at` | `TimestampType` | Yes | UTC timestamp of the most recent status entry. |
+| 10 | `status_history` | `ArrayType(StructType(status_id: LongType, state: StringType, created_at: TimestampType))` | Yes | Full chronological status history array (4 to 8 elements per deployment, `created_at` cast to UTC `TimestampType`). |
+| 11 | `was_successful` | `BooleanType` | No | `True` if **any** entry in `status_history` has `state = 'success'` (`301` `True`, `2` `False`). |
+| 12 | `first_success_at` | `TimestampType` | Yes | Earliest `created_at` among `status_history` entries with `state = 'success'` (`null` when `was_successful = False`). |
+| 13 | `is_prd_environment` | `BooleanType` | No | `True` when `environment` starts with `'prd-'` (`146` production deployments: `134` `prd-clients` + `12` `prd-api`, of which `144` have `was_successful = True`). |
+| 14 | `event_ts` | `TimestampType` | No | `coalesce(latest_status_at, updated_at, created_at)` — non-null ordering timestamp used as Hudi `precombine` field. |
+| 15 | `source_kafka_partition` | `IntegerType` | Yes | Traceability: Kafka partition (`0`) of the winning Bronze message. |
+| 16 | `source_kafka_offset` | `LongType` | Yes | Traceability: Kafka offset of the winning Bronze message. |
+
+> [!WARNING]
+> **Critical DORA Warnings for Gold Analytics (Kamal)**:
+> 1. **`latest_status = 'inactive'` does NOT mean a failed deployment**: GitHub automatically marks a previous deployment as `'inactive'` (`262 / 303` rows) as soon as a newer deployment supersedes it. Relying on `latest_status = 'success'` would only count `39` deployments instead of `301`. Always filter successful deployments with **`was_successful = True`** and use **`first_success_at`** as the actual timestamp when the deployment succeeded.
+> 2. **`production_environment` is always `False`**: In `freeCodeCamp/freeCodeCamp`, the GitHub API field `production_environment` is `False` on all `303` rows. Never filter on `production_environment = True`; instead use **`is_prd_environment = True`** (`environment IN ('prd-clients', 'prd-api')`, an assumption based on the `prd-` / `stg-` naming prefix to be confirmed by the team). For `is_prd_environment = True AND was_successful = True`, there are **`144` successful production deployments** between `2026-09-21 06:44:26` and `2026-11-13 17:20:30` (`2026-09`: `27`, `2026-10`: `65`, `2026-11`: `52`).
+> 3. **DORA Metrics Scope & Limitations in Current Data**:
+>    - **Deployment Frequency**: Fully computable from `silver_deployments` using `is_prd_environment = True AND was_successful = True` grouped by `first_success_at`.
+>    - **Lead Time for Changes**: Requires the commit authorship/merge timestamp (`GET /repos/{owner}/{repo}/commits/{sha}`), which is **not** present in the Kafka messages today (unless approximated by joining `sha` to `silver_builds.head_sha`).
+>    - **Change Failure Rate & Time to Restore Service (MTTR)**: Cannot be reliably computed from this dataset (only `2` failed deployments exist across the entire snapshot, and incidents/rollbacks are not tracked via GitHub deployment statuses) and must be reported as **"not available"** per the team guide.
 
 ---
 
