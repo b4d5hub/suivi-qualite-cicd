@@ -25,13 +25,14 @@ lakehouse/
 │   ├── spark_session.py      # SparkSession builder with Kryo, Hudi 0.15, and MinIO S3A config
 │   ├── schemas.py            # Explicit PySpark StructType schemas for Kafka JSON payloads
 │   ├── bronze_ingest.py      # Kafka -> MinIO Bronze Structured Streaming job
-│   ├── silver_builds.py      # (Planned) Bronze -> Hudi silver_builds upsert job
+│   ├── silver_builds.py      # Bronze -> Hudi silver_builds upsert job
 │   ├── silver_tests.py       # (Planned) Bronze -> Hudi silver_tests upsert job
 │   └── silver_deployments.py # (Planned) Bronze -> Hudi silver_deployments upsert job
 └── tools/                    # Verification and diagnostic scripts
     ├── smoke_test.py         # Verifies S3A Parquet round trip, Kafka counts, and Hudi COW upsert
     ├── check_contract.py     # Verifies Kafka data contract (schemas, keys, nulls, timestamps, distributions)
     ├── verify_bronze.py      # Verifies Bronze Parquet tables, contiguous offsets, and byte-identical Kafka raw proof
+    ├── verify_silver.py      # Verifies Silver Hudi tables (schemas, counts, deduplication, equivalence with Bronze)
     └── verify_lakehouse.py   # (Planned) Validates row counts and proves zero duplicates after re-runs
 ```
 
@@ -74,7 +75,7 @@ lakehouse/
 - [x] Shared configuration and `SparkSession` builder (`config.py`, `spark_session.py`)
 - [x] Explicit PySpark JSON schemas and data-contract check (`schemas.py`, `tools/check_contract.py`)
 - [x] Kafka -> MinIO Bronze Structured Streaming job and verification (`src/bronze_ingest.py`, `tools/verify_bronze.py`)
-- [ ] Bronze -> Hudi `silver_builds` upsert job (`silver_builds.py`)
+- [x] Bronze -> Hudi `silver_builds` upsert job and verification (`src/silver_builds.py`, `tools/verify_silver.py silver_builds`)
 - [ ] Bronze -> Hudi `silver_tests` and `silver_deployments` upsert jobs (`silver_tests.py`, `silver_deployments.py`)
 - [ ] End-to-end verification script (`verify_lakehouse.py`), idempotency proof, and final run documentation
 
@@ -158,6 +159,57 @@ Because the Bronze layer is **append-only Parquet** and Spark Structured Streami
   # Example only (do NOT run during normal operation):
   # docker exec lakehouse-minio rm -rf /data/cicd-lakehouse/bronze/<topic> /data/cicd-lakehouse/_checkpoints/bronze/<topic>
   ```
+
+---
+
+## Run Silver `silver_builds` Job & Verification (Bronze -> Hudi COPY_ON_WRITE)
+
+Read `s3a://cicd-lakehouse/bronze/builds/`, cast UTC timestamps, compute approximate `duration_s`, deduplicate by `(run_id, run_attempt)` ordering by `(updated_at DESC, source_kafka_offset DESC)`, and upsert into `s3a://cicd-lakehouse/silver/silver_builds`:
+
+```powershell
+# 1. Run silver_builds Hudi upsert job
+docker compose -f lakehouse/compose.lakehouse.yml run --rm spark src/silver_builds.py
+
+# 2. Verify silver_builds (schema, 7,438 rows, key 44069120063:1, conclusion distribution, Bronze equivalence)
+docker compose -f lakehouse/compose.lakehouse.yml run --rm spark tools/verify_silver.py silver_builds
+
+# 3. Inspect Hudi table properties in MinIO (note: MinIO xl.meta stores objects inside a folder)
+docker exec lakehouse-minio ls /data/cicd-lakehouse/silver
+docker exec lakehouse-minio sh -c "mc alias set local http://localhost:9000 minioadmin minioadmin >/dev/null && mc cat local/cicd-lakehouse/silver/silver_builds/.hoodie/hoodie.properties"
+```
+
+### Silver Contract: `silver_builds` (Handover Reference for Kamal — Gold / MLlib)
+
+- **MinIO S3A Path**: `s3a://cicd-lakehouse/silver/silver_builds`
+- **Hudi Table Configuration**:
+  - `hoodie.table.name`: `silver_builds`
+  - `hoodie.datasource.write.table.type`: `COPY_ON_WRITE` (pure Parquet base files; read with `spark.read.format("hudi").load("s3a://cicd-lakehouse/silver/silver_builds")`)
+  - `hoodie.datasource.write.operation`: `upsert`
+  - `hoodie.datasource.write.recordkey.field`: `run_id,run_attempt` (composite key using `org.apache.hudi.keygen.NonpartitionedKeyGenerator` so the table is unpartitioned while supporting a 2-column primary key)
+  - `hoodie.datasource.write.precombine.field`: `updated_at`
+  - `hoodie.metadata.enable`: `false` (disabled to keep memory and small-file overhead low on 3.7 GiB RAM machines)
+  - `spark.sql.session.timeZone`: `UTC` (enforced in `spark_session.py`)
+
+| # | Column | Spark Type | Nullable | Description / Contract Notes |
+| :- | :--- | :--- | :--- | :--- |
+| 1 | `run_id` | `LongType` | No | GitHub Actions workflow run ID (part 1 of composite record key). |
+| 2 | `run_attempt` | `IntegerType` | No | Attempt number (`1, 2, 3, ...`) for this workflow run (part 2 of composite record key; `195` runs in the snapshot have `>1` attempt stored as distinct rows). |
+| 3 | `workflow` | `StringType` | Yes | Workflow name (e.g., `"CI - Node.js"`). |
+| 4 | `event` | `StringType` | Yes | GitHub trigger event (`"push"`, `"pull_request"`, `"pull_request_target"`, `"schedule"`, etc.). |
+| 5 | `branch` | `StringType` | Yes | Target/head git branch name (`head_branch`). |
+| 6 | `head_sha` | `StringType` | Yes | Commit SHA tested by the run. |
+| 7 | `status` | `StringType` | No | Execution state (`"completed"`, `"in_progress"`, `"queued"`). |
+| 8 | `conclusion` | `StringType` | Yes | Final outcome when `status == 'completed'`: `"success"` (`5,857`), `"failure"` (`808`), `"cancelled"` (`561`), `"action_required"` (`207`), `"startup_failure"` (`5`). |
+| 9 | `created_at` | `TimestampType` | Yes | UTC timestamp when the workflow run was created. |
+| 10 | `started_at` | `TimestampType` | Yes | UTC timestamp when the run attempt started (`run_started_at`). |
+| 11 | `updated_at` | `TimestampType` | No | UTC timestamp of the last update to the run (Hudi `precombine` field). |
+| 12 | `duration_s` | `LongType` | Yes | **Approximate** run duration in seconds: `unix_timestamp(updated_at) - unix_timestamp(started_at)` when `status == 'completed'` and difference $\ge 0$ (`null` otherwise). Since GitHub's workflow run object does not provide an explicit `completed_at` timestamp, `updated_at` is used as an approximation (a re-run or late status update can yield a large span). |
+| 13 | `source_kafka_partition` | `IntegerType` | Yes | Traceability: Kafka partition (`0`) of the winning Bronze message. |
+| 14 | `source_kafka_offset` | `LongType` | Yes | Traceability: Kafka offset of the winning Bronze message. |
+
+> [!WARNING]
+> **Important Note for Gold Success-Rate & MLlib Queries (Kamal)**:
+> All `7,438` rows in `silver_builds` have `status = 'completed'`, **but not all completed runs are successes or failures**. Specifically, `conclusion` can be `'cancelled'` (`561` rows), `'action_required'` (`207` rows), or `'startup_failure'` (`5` rows). Per the Cahier des Charges (Section 8: `Taux de réussite = Runs réussis / (runs réussis + runs en échec)`), **do NOT count `'cancelled'`, `'action_required'`, or `'startup_failure'` as either `success` or `failure`** when computing build success rates or training binary classification labels (`conclusion IN ('success', 'failure')`).
 
 ---
 

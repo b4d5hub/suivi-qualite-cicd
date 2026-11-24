@@ -40,6 +40,7 @@ def get_spark(app_name: str) -> SparkSession:
             "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider",
         )
         # Keep memory footprint and task overhead small on a 3.7 GiB machine
+        .config("spark.sql.session.timeZone", "UTC")
         .config("spark.sql.shuffle.partitions", "4")
         .config("spark.ui.enabled", "false")
         .getOrCreate()
