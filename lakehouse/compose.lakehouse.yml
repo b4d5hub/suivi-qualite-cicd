@@ -44,6 +44,7 @@ services:
       - ./src:/opt/lakehouse/src
       - ./tools:/opt/lakehouse/tools
       - ./submit.sh:/opt/lakehouse/submit.sh:ro
+      - ./run_all.sh:/opt/lakehouse/run_all.sh:ro
       - lakehouse_ivy_cache:/tmp/ivy
     entrypoint: ["bash", "/opt/lakehouse/submit.sh"]
 

@@ -1,28 +1,65 @@
 # Lakehouse Module — Bronze (MinIO Parquet) & Silver (Apache Hudi)
 
-## Purpose
+## 1. Overview & Architecture
 
-This folder (`lakehouse/`) implements the **Data Lake (Bronze)** and **Lakehouse (Silver)** layers of the CI/CD Quality Monitoring platform for `freeCodeCamp/freeCodeCamp` (owned by Mohamed):
+This folder (`lakehouse/`, owned by **Mohamed**) implements the **Data Lake (Bronze)** and **Lakehouse (Silver)** layers of the CI/CD Quality Monitoring platform for `freeCodeCamp/freeCodeCamp`:
 
-1. **MinIO S3 Storage**: Hosts the `cicd-lakehouse` bucket for raw Bronze data, Silver Hudi tables, and Spark Structured Streaming checkpoints.
-2. **Bronze Layer**: Uses Spark Structured Streaming (`startingOffsets=earliest`, `trigger(availableNow=True)`) to consume raw JSON messages from the 3 Kafka topics (`builds`, `tests`, `deployments`) and write append-only Parquet files with Kafka metadata.
-3. **Silver Layer**: Uses PySpark batch jobs to parse Bronze JSON payloads, cast types, compute derived fields (`builds.duration_s` and `deployments.was_successful`), and **upsert** deduplicated records into 3 Apache Hudi (`COPY_ON_WRITE`, unpartitioned) tables.
+1. **MinIO S3 Storage (`lakehouse-minio`)**: Hosts the `cicd-lakehouse` S3 bucket for raw Bronze Parquet data, Silver Apache Hudi tables, and Spark Structured Streaming checkpoints.
+2. **Bronze Layer (`s3a://cicd-lakehouse/bronze/<topic>/`)**: Uses Spark Structured Streaming (`startingOffsets=earliest`, `trigger(availableNow=True)`) to consume raw JSON messages from the 3 Kafka topics (`builds`, `tests`, `deployments`) and write append-only Parquet files preserving the untouched `raw_json` payload and Kafka metadata.
+3. **Silver Layer (`s3a://cicd-lakehouse/silver/<table>`)**: Uses PySpark batch jobs to parse Bronze JSON payloads against explicit `StructType` schemas, cast ISO-8601 UTC timestamps, compute derived fields (`builds.duration_s`, `tests.event_ts`, `deployments.was_successful`, `deployments.first_success_at`, `deployments.is_prd_environment`, `deployments.event_ts`), deterministically deduplicate by record key, and **upsert** into 3 Apache Hudi (`COPY_ON_WRITE`, unpartitioned) tables.
 
----
+```text
++-----------------------------------------------------------------------------------+
+|                        Kafka Broker (ingestion-kafka-1)                           |
+|               kafka:19092 on Docker network: ingestion_default                    |
+|     Topics:  builds (7,441 msgs)  |  tests (22,747 msgs)  |  deployments (306)    |
++-----------------------------------+-----------------------------------------------+
+                                    |
+                                    | Spark Structured Streaming (availableNow=True)
+                                    | src/bronze_ingest.py
+                                    v
++-----------------------------------------------------------------------------------+
+|             MinIO Bucket: s3a://cicd-lakehouse (lakehouse-minio:9000)             |
+|                                                                                   |
+|  1. Checkpoints (offset tracking paired with Bronze folders):                     |
+|     - s3a://cicd-lakehouse/_checkpoints/bronze/{builds,tests,deployments}/        |
+|                                                                                   |
+|  2. Bronze Layer (Append-Only Raw Parquet, 7 columns, byte-identical raw_json):   |
+|     - s3a://cicd-lakehouse/bronze/builds/             (7,441 rows, 7,438 keys)    |
+|     - s3a://cicd-lakehouse/bronze/tests/              (22,747 rows, 22,744 keys)  |
+|     - s3a://cicd-lakehouse/bronze/deployments/        (306 rows, 303 keys)        |
+|                                   |                                               |
+|                                   | PySpark Batch + Hudi COPY_ON_WRITE Upsert     |
+|                                   | src/silver_{builds,tests,deployments}.py      |
+|                                   v                                               |
+|  3. Silver Layer (Apache Hudi 0.15.0, COPY_ON_WRITE, unpartitioned, deduplicated):|
+|     - s3a://cicd-lakehouse/silver/silver_builds       (7,438 rows, 14 columns)    |
+|         key: (run_id, run_attempt) | precombine: updated_at                       |
+|     - s3a://cicd-lakehouse/silver/silver_tests        (22,744 rows, 13 columns)   |
+|         key: job_id                | precombine: event_ts                         |
+|     - s3a://cicd-lakehouse/silver/silver_deployments  (303 rows, 16 columns)      |
+|         key: deployment_id         | precombine: event_ts                         |
++-----------------------------------+-----------------------------------------------+
+                                    |
+                                    v
+             Downstream Consumers: Gold Analytics & MLlib (Kamal),
+                 Airflow Orchestration (Youssef), Dashboard
+```
 
-## Planned Directory Layout
+### Directory Layout
 
 ```text
 lakehouse/
 ├── .env.example              # Safe development defaults for MinIO, Kafka, and bucket name
-├── README.md                 # Architecture, data contracts, checklist, and run guide
+├── .gitattributes            # Enforces LF line endings on *.sh files for Linux containers
+├── README.md                 # Architecture, quick start, command reference, data contracts, handover
 ├── VERSIONS.md               # Pinned versions for Spark, Hudi, Hadoop-AWS, MinIO, and known risks
 ├── compose.lakehouse.yml     # Docker Compose for MinIO (cicd-lakehouse) and Spark 3.5.1 container
 ├── submit.sh                 # Central spark-submit wrapper with Maven packages and local[2] settings
-├── run_all.sh                # (Planned) Helper script to run Bronze + Silver + verification
+├── run_all.sh                # One-command pipeline runner (Bronze -> Silver -> Verification)
 ├── src/                      # PySpark jobs and shared modules
 │   ├── config.py             # Environment settings and S3A/checkpoint/table path helpers
-│   ├── spark_session.py      # SparkSession builder with Kryo, Hudi 0.15, and MinIO S3A config
+│   ├── spark_session.py      # SparkSession builder with UTC, Kryo, Hudi 0.15, and MinIO S3A config
 │   ├── schemas.py            # Explicit PySpark StructType schemas for Kafka JSON payloads
 │   ├── bronze_ingest.py      # Kafka -> MinIO Bronze Structured Streaming job
 │   ├── silver_common.py      # Shared UTC timestamp cast, batch deduplication, and Hudi options
@@ -34,42 +71,12 @@ lakehouse/
     ├── check_contract.py     # Verifies Kafka data contract (schemas, keys, nulls, timestamps, distributions)
     ├── verify_bronze.py      # Verifies Bronze Parquet tables, contiguous offsets, and byte-identical Kafka raw proof
     ├── verify_silver.py      # Verifies Silver Hudi tables (schemas, counts, deduplication, equivalence with Bronze)
-    └── verify_lakehouse.py   # (Planned) Validates row counts and proves zero duplicates after re-runs
+    └── demo_upsert.py        # Self-contained synthetic Hudi upsert test inside _smoke/upsert_demo/
 ```
 
----
+### Task Checklist
 
-## Data Contract Summary
-
-> **Note on Bronze Naming**: Project specifications (`cdc_v1__2_.docx`) refer to the logical Bronze tables as `bronze_builds`, `bronze_tests`, and `bronze_deployments`, while the physical object storage paths in MinIO are `s3a://cicd-lakehouse/bronze/builds/`, `s3a://cicd-lakehouse/bronze/tests/`, and `s3a://cicd-lakehouse/bronze/deployments/`.
-
-### 1. Bronze Layer (Raw Append-Only Parquet)
-
-- **Checkpoints**: `s3a://cicd-lakehouse/_checkpoints/bronze/<topic>/`
-- **Columns (all 3 topics)**:
-  `kafka_key` (`string`), `raw_json` (`string`), `kafka_topic` (`string`), `kafka_partition` (`int`), `kafka_offset` (`bigint`), `kafka_timestamp` (`timestamp`), `ingested_at` (`timestamp`).
-
-| Logical Name | Kafka Topic | MinIO Path | Expected Rows (Snapshot) |
-| :--- | :--- | :--- | ---: |
-| `bronze_builds` | `builds` | `s3a://cicd-lakehouse/bronze/builds/` | `7,441` |
-| `bronze_tests` | `tests` | `s3a://cicd-lakehouse/bronze/tests/` | `22,747` |
-| `bronze_deployments` | `deployments` | `s3a://cicd-lakehouse/bronze/deployments/` | `306` |
-
-### 2. Silver Layer (Apache Hudi `COPY_ON_WRITE`, Unpartitioned, `upsert`)
-
-| Hudi Table | MinIO Path | Record Key | Precombine Field | Special Transformations | Expected Rows (Snapshot) |
-| :--- | :--- | :--- | :--- | :--- | ---: |
-| `silver_builds` | `s3a://cicd-lakehouse/silver/silver_builds` | `run_id,run_attempt` | `updated_at` | Cast ISO timestamps; compute `duration_s = updated_at - started_at` (seconds) when `status == 'completed'`. | `7,438` |
-| `silver_tests` | `s3a://cicd-lakehouse/silver/silver_tests` | `job_id` | `event_ts` | Cast ISO timestamps; compute `event_ts = coalesce(completed_at, started_at)`. | `22,744` |
-| `silver_deployments` | `s3a://cicd-lakehouse/silver/silver_deployments` | `deployment_id` | `event_ts` | Cast ISO timestamps; compute `event_ts = coalesce(latest_status_at, updated_at, created_at)` and boolean `was_successful` (`true` if any entry in `status_history` has `state == 'success'`). | `303` |
-
-- **Deduplication Benchmark**: Key `44069120063:1` (`run_id=44069120063, run_attempt=1`) appears **4 times** in `bronze/builds/` and must appear **exactly once** in `silver_builds`.
-
----
-
-## Task Checklist
-
-- [x] Foundation of `lakehouse/` (`.gitignore`, folders, `VERSIONS.md`, `.env.example`, `README.md`)
+- [x] Foundation of `lakehouse/` (`.gitignore`, `.gitattributes`, folders, `VERSIONS.md`, `.env.example`, `README.md`)
 - [x] MinIO service (`lakehouse-minio`) with automatic `cicd-lakehouse` bucket creation on `ingestion_default`
 - [x] Spark container (`apache/spark:3.5.1-scala2.12-java17-python3-ubuntu`) and `submit.sh` in `compose.lakehouse.yml`
 - [x] Verify Kafka network and historical snapshot data (`7,441` / `22,747` / `306` records via `tools/smoke_test.py`)
@@ -79,78 +86,111 @@ lakehouse/
 - [x] Bronze -> Hudi `silver_builds` upsert job and verification (`src/silver_builds.py`, `tools/verify_silver.py silver_builds`)
 - [x] Bronze -> Hudi `silver_tests` upsert job and verification (`src/silver_tests.py`, `tools/verify_silver.py silver_tests`)
 - [x] Bronze -> Hudi `silver_deployments` upsert job and verification (`src/silver_deployments.py`, `tools/verify_silver.py silver_deployments`)
-- [ ] End-to-end verification script (`verify_lakehouse.py`), idempotency proof, and final run documentation
+- [x] End-to-end pipeline script (`run_all.sh`), synthetic upsert proof (`tools/demo_upsert.py`), idempotency verification, and final handover documentation
 
 ---
 
-## Start MinIO
+## 2. Prerequisites & Tested Machine Resources
 
-With the Kafka stack's network (`ingestion_default`) already present, start the Lakehouse MinIO service from the repository root:
+- **OS & Shell**: Windows 10/11 with PowerShell (or Linux/macOS bash) and Docker Desktop (WSL2 backend).
+- **Resource Envelope (Verified on a Constrained Laptop)**:
+  - **Available Docker RAM**: `~3.7 GiB` total (`lakehouse-minio` capped at `512m`, uses `~184 MiB`; `lakehouse-spark` capped at `2g` with `1g` driver heap; `ingestion-kafka-1` uses `~410 MiB`).
+  - **Disk Footprint**:
+    - Docker image `apache/spark:3.5.1-scala2.12-java17-python3-ubuntu`: `~1.05 GB`.
+    - Docker image `minio/minio:RELEASE.2024-01-16T16-07-38Z`: `~151 MB`.
+    - Cached Maven JARs in Docker volume `lakehouse_ivy_cache`: `~130 MB` (downloaded once on first run).
+    - Complete MinIO bucket `/data/cicd-lakehouse` (all 3 Bronze tables + checkpoints + all 3 Silver Hudi tables): **`~11 MB`**.
+- **Port Mappings**:
+  - `lakehouse-minio` binds to **`127.0.0.1:9100` (S3 API)** and **`127.0.0.1:9101` (Web Console)** on the host so it never collides with other local services using `9000/9001`. Inside the Docker network (`ingestion_default`), Spark connects to **`http://minio:9000`**.
+
+---
+
+## 3. Quick Start from Zero (Copy-Paste Commands)
+
+Run all commands from the **repository root** (`suivi-qualite-cicd/`):
+
+### Step 1 — Start Kafka and Replay the Historical Snapshot (if not already seeded)
+
+If starting from a fresh clone where the `ingestion_kafka_data` Docker volume is empty or has root-owned permissions, initialize the volume ownership for `appuser`, start Kafka, wait for topic leaders, and replay the JSONL snapshot:
+
+```powershell
+# 1. Start the Kafka container (creates the ingestion_default network and volume)
+docker compose -f ingestion/compose.kafka.yml up -d kafka
+
+# 2. If starting from a brand-new volume on Windows/WSL2, ensure /var/lib/kafka/data is owned by appuser
+docker compose -f ingestion/compose.kafka.yml exec -T -u root kafka chown -R appuser:appuser /var/lib/kafka/data
+
+# 3. Replay the historical snapshot (builds=7,441, tests=22,747, deployments=306)
+python ingestion/tools/kafka_history.py replay
+
+# 4. Wait a few seconds and confirm all 3 topic offsets are ready (7441 / 22747 / 306)
+docker compose -f ingestion/compose.kafka.yml exec -T kafka /opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server kafka:19092 --topic builds
+docker compose -f ingestion/compose.kafka.yml exec -T kafka /opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server kafka:19092 --topic tests
+docker compose -f ingestion/compose.kafka.yml exec -T kafka /opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server kafka:19092 --topic deployments
+```
+
+### Step 2 — Start Lakehouse MinIO
 
 ```powershell
 docker compose -f lakehouse/compose.lakehouse.yml up -d minio
 docker ps --filter "name=lakehouse-minio"
-docker exec lakehouse-minio ls /data
 Invoke-WebRequest -UseBasicParsing http://localhost:9100/minio/health/live
 ```
 
-- **Internal Docker S3 Endpoint (for Spark)**: `http://minio:9000`
-- **Host S3 API**: `http://localhost:9100` (mapped to `9100` to avoid conflicts with other projects using `9000`)
-- **Host Web Console**: `http://localhost:9101`
-
----
-
-## Run Smoke Test (S3A + Kafka + Hudi)
-
-Run the one-shot Spark container against MinIO (`http://minio:9000`) and Kafka (`kafka:19092`):
+### Step 3 — Run the Entire Lakehouse Pipeline & Verifications in One Command
 
 ```powershell
-docker compose -f lakehouse/compose.lakehouse.yml run --rm spark tools/smoke_test.py
+docker compose -f lakehouse/compose.lakehouse.yml run --rm --entrypoint bash spark /opt/lakehouse/run_all.sh
 ```
 
 ---
 
-## Run Data-Contract Verification (Read-Only on Kafka)
+## 4. Command Reference
 
-Validate all 30,494 Kafka messages against `src/schemas.py`:
+All Spark jobs and verification tools run inside the one-shot `spark` service (`profiles: ["tools"]`, `--rm` removes the container immediately after exit):
 
-```powershell
-docker compose -f lakehouse/compose.lakehouse.yml run --rm spark tools/check_contract.py
-```
-
-### Data Contract Findings (Verified on Snapshot)
-
-- **100% Schema & Key Match**: Every message across `builds` (`7,441`), `tests` (`22,747`), and `deployments` (`306`) parses cleanly with `0` null structs, `0` key mismatches, `0` extra/missing JSON fields, and `0` timestamp format violations (`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$`).
-- **Duplicate Keys in Snapshot**: There are exactly 3 extra records per topic (`7,441 -> 7,438`, `22,747 -> 22,744`, `306 -> 303`). In `builds`, key `44069120063:1` appears `4` times (accounting for the 3 duplicates).
-- **`builds` Conclusions & `duration_s`**:
-  - Across all `7,441` records: `success=5,860`, `failure=808`, `cancelled=561`, `action_required=207`, `startup_failure=5` (after deduplicating to `7,438` keys: `success=5,857`). All `7,441` records have `status='completed'`.
-  - `builds.duration_s` is `null` in all `7,441 / 7,441` rows (`100%` null) and must be computed in Silver from `updated_at - started_at`.
-- **`tests` Conclusions & `duration_s`**:
-  - Across all `22,747` records: `success=17,493`, `skipped=3,654`, `cancelled=951`, `failure=649` (after deduplicating to `22,744` keys: `success=17,490`).
-  - `tests.duration_s` is `null` in `3,794 / 22,747` rows (`3,654` skipped jobs + `140` cancelled jobs that never started or had a zero/missing duration) and populated in `18,953` rows.
-- **`deployments` Environments & `was_successful`**:
-  - `production_environment` is `False` for all `306 / 306` records; environment filtering must use `environment` (`stg-clients=144`, `prd-clients=134`, `stg-api=13`, `prd-api=12` distinct keys; `prd-api=15` in raw records).
-  - `latest_status` is mostly `inactive=262` (`success=42` raw / `39` distinct, `failure=2`), whereas deriving `was_successful` from `status_history` recovers `True=301` successful deployments and `False=2` failed deployments out of `303` distinct deployments.
+| Action | Host Command (from Repository Root) | Expected Result |
+| :--- | :--- | :--- |
+| **Start MinIO** | `docker compose -f lakehouse/compose.lakehouse.yml up -d minio` | `lakehouse-minio` Up (`healthy`), `/data/cicd-lakehouse` created |
+| **Full Pipeline + Verify** | `docker compose -f lakehouse/compose.lakehouse.yml run --rm --entrypoint bash spark /opt/lakehouse/run_all.sh` | Runs `bronze_ingest`, `silver_builds`, `silver_tests`, `silver_deployments`, `verify_bronze`, `verify_silver` (`PASS`) |
+| **Pipeline (Skip Verify)** | `docker compose -f lakehouse/compose.lakehouse.yml run --rm --entrypoint bash spark /opt/lakehouse/run_all.sh --skip-verify` | Runs only the 4 ingestion/upsert steps |
+| **Run Single Step via `run_all.sh`** | `docker compose -f lakehouse/compose.lakehouse.yml run --rm --entrypoint bash spark /opt/lakehouse/run_all.sh --only <step>` | Runs one step (`bronze_ingest`, `silver_builds`, `silver_tests`, `silver_deployments`, `verify_bronze`, `verify_silver`) |
+| **Bronze Ingestion Only** | `docker compose -f lakehouse/compose.lakehouse.yml run --rm spark src/bronze_ingest.py` | Streams `builds`, `tests`, `deployments` from Kafka to Bronze Parquet |
+| **Silver Builds Only** | `docker compose -f lakehouse/compose.lakehouse.yml run --rm spark src/silver_builds.py` | Upserts `7,438` rows into `s3a://cicd-lakehouse/silver/silver_builds` |
+| **Silver Tests Only** | `docker compose -f lakehouse/compose.lakehouse.yml run --rm spark src/silver_tests.py` | Upserts `22,744` rows into `s3a://cicd-lakehouse/silver/silver_tests` |
+| **Silver Deployments Only** | `docker compose -f lakehouse/compose.lakehouse.yml run --rm spark src/silver_deployments.py` | Upserts `303` rows into `s3a://cicd-lakehouse/silver/silver_deployments` |
+| **Verify Bronze** | `docker compose -f lakehouse/compose.lakehouse.yml run --rm spark tools/verify_bronze.py` | Verifies columns, row counts, contiguous offsets, byte-identical Kafka match |
+| **Verify All Silver Tables** | `docker compose -f lakehouse/compose.lakehouse.yml run --rm spark tools/verify_silver.py silver_builds silver_tests silver_deployments` | Verifies schemas, row counts, zero duplicates, distributions, Bronze equivalence |
+| **Verify One Silver Table** | `docker compose -f lakehouse/compose.lakehouse.yml run --rm spark tools/verify_silver.py <table_name>` | Verifies `silver_builds`, `silver_tests`, or `silver_deployments` |
+| **Check Kafka Data Contract** | `docker compose -f lakehouse/compose.lakehouse.yml run --rm spark tools/check_contract.py` | Read-only check of all `30,494` Kafka messages against `src/schemas.py` |
+| **Synthetic Upsert Demo** | `docker compose -f lakehouse/compose.lakehouse.yml run --rm spark tools/demo_upsert.py` | Tests Hudi in-place update & late-record behavior in `_smoke/upsert_demo/` |
+| **Environment Smoke Test** | `docker compose -f lakehouse/compose.lakehouse.yml run --rm spark tools/smoke_test.py` | Tests S3A Parquet round trip, Kafka connectivity, and Hudi COW upsert |
 
 ---
 
-## Run Bronze Ingestion & Verification (Kafka -> MinIO Parquet)
+## 5. Data Layers & Contracts
 
-Stream all 3 topics (`builds`, `tests`, `deployments`) sequentially from Kafka (`startingOffsets=earliest`, `trigger(availableNow=True)`) into `s3a://cicd-lakehouse/bronze/<topic>/` with per-topic checkpoints at `s3a://cicd-lakehouse/_checkpoints/bronze/<topic>/`:
+> **Note on Bronze Naming**: Project specifications (`cdc_v1__2_.docx`) refer to the logical Bronze tables as `bronze_builds`, `bronze_tests`, and `bronze_deployments`, while the physical object storage paths in MinIO are `s3a://cicd-lakehouse/bronze/builds/`, `s3a://cicd-lakehouse/bronze/tests/`, and `s3a://cicd-lakehouse/bronze/deployments/`.
 
-```powershell
-# 1. Run Bronze Structured Streaming ingestion
-docker compose -f lakehouse/compose.lakehouse.yml run --rm spark src/bronze_ingest.py
+### 5.1 Bronze Layer (Raw Append-Only Parquet)
 
-# 2. Run Bronze verification (columns, counts, offsets, byte-identical Kafka raw proof, schema parse)
-docker compose -f lakehouse/compose.lakehouse.yml run --rm spark tools/verify_bronze.py
+- **Checkpoints**: `s3a://cicd-lakehouse/_checkpoints/bronze/<topic>/`
+- **Columns (exact order across all 3 topics)**:
+  1. `kafka_key` (`StringType`) — message key (`"{run_id}:{run_attempt}"`, `"{job_id}"`, or `"{deployment_id}"`)
+  2. `raw_json` (`StringType`) — untouched UTF-8 JSON string from Kafka (`value` cast to string without parsing or re-serializing)
+  3. `kafka_topic` (`StringType`) — `"builds"`, `"tests"`, or `"deployments"`
+  4. `kafka_partition` (`IntegerType`) — Kafka partition (`0`)
+  5. `kafka_offset` (`LongType`) — Kafka offset (`0 .. N-1`)
+  6. `kafka_timestamp` (`TimestampType`) — Kafka message timestamp (UTC)
+  7. `ingested_at` (`TimestampType`) — Spark ingestion UTC timestamp (`current_timestamp()`)
 
-# 3. Inspect Bronze directories and size in MinIO
-docker exec lakehouse-minio ls /data/cicd-lakehouse/bronze
-docker exec lakehouse-minio du -sh /data/cicd-lakehouse
-```
+| Logical Name | Kafka Topic | MinIO Path | Total Rows | Distinct Keys | Benchmark Duplicate Key (4x in Bronze -> 1x in Silver) |
+| :--- | :--- | :--- | ---: | ---: | :--- |
+| `bronze_builds` | `builds` | `s3a://cicd-lakehouse/bronze/builds/` | `7,441` | `7,438` | `44069120063:1` (offsets `3253, 3254, 3255, 3256`) |
+| `bronze_tests` | `tests` | `s3a://cicd-lakehouse/bronze/tests/` | `22,747` | `22,744` | `133990467008` (offsets `9951, 9952, 9953, 9954`) |
+| `bronze_deployments` | `deployments` | `s3a://cicd-lakehouse/bronze/deployments/` | `306` | `303` | `7769301245` (offsets `0, 1, 2, 3`) |
 
-### Bronze Reset Procedure (Documentation Only — Do Not Run Unnecessarily)
+#### Bronze Reset Procedure (Documentation Only — Do Not Run Unnecessarily)
 
 Because the Bronze layer is **append-only Parquet** and Spark Structured Streaming tracks consumed Kafka offsets in its checkpoint folder (`s3a://cicd-lakehouse/_checkpoints/bronze/<topic>/`), **a Bronze data folder and its checkpoint folder are a linked pair**:
 
@@ -164,23 +204,7 @@ Because the Bronze layer is **append-only Parquet** and Spark Structured Streami
 
 ---
 
-## Run Silver `silver_builds` Job & Verification (Bronze -> Hudi COPY_ON_WRITE)
-
-Read `s3a://cicd-lakehouse/bronze/builds/`, cast UTC timestamps, compute approximate `duration_s`, deduplicate by `(run_id, run_attempt)` ordering by `(updated_at DESC, source_kafka_offset DESC)`, and upsert into `s3a://cicd-lakehouse/silver/silver_builds`:
-
-```powershell
-# 1. Run silver_builds Hudi upsert job
-docker compose -f lakehouse/compose.lakehouse.yml run --rm spark src/silver_builds.py
-
-# 2. Verify silver_builds (schema, 7,438 rows, key 44069120063:1, conclusion distribution, Bronze equivalence)
-docker compose -f lakehouse/compose.lakehouse.yml run --rm spark tools/verify_silver.py silver_builds
-
-# 3. Inspect Hudi table properties in MinIO (note: MinIO xl.meta stores objects inside a folder)
-docker exec lakehouse-minio ls /data/cicd-lakehouse/silver
-docker exec lakehouse-minio sh -c "mc alias set local http://localhost:9000 minioadmin minioadmin >/dev/null && mc cat local/cicd-lakehouse/silver/silver_builds/.hoodie/hoodie.properties"
-```
-
-### Silver Contract: `silver_builds` (Handover Reference for Kamal — Gold / MLlib)
+### 5.2 Silver Table 1: `silver_builds` (Hudi `COPY_ON_WRITE`, `7,438` rows)
 
 - **MinIO S3A Path**: `s3a://cicd-lakehouse/silver/silver_builds`
 - **Hudi Table Configuration**:
@@ -216,23 +240,7 @@ docker exec lakehouse-minio sh -c "mc alias set local http://localhost:9000 mini
 
 ---
 
-## Run Silver `silver_tests` Job & Verification (Bronze -> Hudi COPY_ON_WRITE)
-
-Read `s3a://cicd-lakehouse/bronze/tests/`, cast UTC timestamps, keep `duration_s` untouched as computed by the collector, compute `event_ts = coalesce(completed_at, started_at)`, deduplicate by `job_id` ordering by `(event_ts DESC, source_kafka_offset DESC)`, and upsert into `s3a://cicd-lakehouse/silver/silver_tests`:
-
-```powershell
-# 1. Run silver_tests Hudi upsert job
-docker compose -f lakehouse/compose.lakehouse.yml run --rm spark src/silver_tests.py
-
-# 2. Verify silver_tests (schema, 22,744 rows, job_id 133990467008, duration consistency, Bronze equivalence, silver_builds integrity)
-docker compose -f lakehouse/compose.lakehouse.yml run --rm spark tools/verify_silver.py silver_tests
-
-# 3. Inspect Hudi table properties in MinIO
-docker exec lakehouse-minio ls /data/cicd-lakehouse/silver
-docker exec lakehouse-minio sh -c "mc alias set local http://localhost:9000 minioadmin minioadmin >/dev/null && mc cat local/cicd-lakehouse/silver/silver_tests/.hoodie/hoodie.properties"
-```
-
-### Silver Contract: `silver_tests` (Handover Reference for Kamal — Flaky Jobs & Gold)
+### 5.3 Silver Table 2: `silver_tests` (Hudi `COPY_ON_WRITE`, `22,744` rows)
 
 - **What a Row Represents**: Each row in `silver_tests` is a **GitHub Actions Job** (e.g., `'Build E2E API (Container)'`, `'Test - i18n'`, `'Lint (24)'`, `'triage'`), **not an individual unit test case**. There are `73` distinct `job_name` values across `22,744` jobs, and `100%` of `(run_id, run_attempt)` pairs (`0` orphans) join cleanly to `silver_builds`.
 - **MinIO S3A Path**: `s3a://cicd-lakehouse/silver/silver_tests`
@@ -270,24 +278,7 @@ docker exec lakehouse-minio sh -c "mc alias set local http://localhost:9000 mini
 
 ---
 
-## Run Silver `silver_deployments` Job & Verification (Bronze -> Hudi COPY_ON_WRITE)
-
-Read `s3a://cicd-lakehouse/bronze/deployments/`, cast top-level and nested `status_history[].created_at` UTC timestamps, derive `was_successful`, `first_success_at`, `is_prd_environment`, and `event_ts = coalesce(latest_status_at, updated_at, created_at)`, deduplicate by `deployment_id` ordering by `(event_ts DESC, source_kafka_offset DESC)`, and upsert into `s3a://cicd-lakehouse/silver/silver_deployments`:
-
-```powershell
-# 1. Run silver_deployments Hudi upsert job
-docker compose -f lakehouse/compose.lakehouse.yml run --rm spark src/silver_deployments.py
-
-# 2. Verify silver_deployments (or verify all 3 Silver tables in one run)
-docker compose -f lakehouse/compose.lakehouse.yml run --rm spark tools/verify_silver.py silver_deployments
-docker compose -f lakehouse/compose.lakehouse.yml run --rm spark tools/verify_silver.py silver_builds silver_tests silver_deployments
-
-# 3. Inspect Hudi table properties in MinIO
-docker exec lakehouse-minio ls /data/cicd-lakehouse/silver
-docker exec lakehouse-minio sh -c "mc alias set local http://localhost:9000 minioadmin minioadmin >/dev/null && mc cat local/cicd-lakehouse/silver/silver_deployments/.hoodie/hoodie.properties"
-```
-
-### Silver Contract: `silver_deployments` (Handover Reference for Kamal — DORA Metrics & Gold)
+### 5.4 Silver Table 3: `silver_deployments` (Hudi `COPY_ON_WRITE`, `303` rows)
 
 - **MinIO S3A Path**: `s3a://cicd-lakehouse/silver/silver_deployments`
 - **Hudi Table Configuration**:
@@ -328,6 +319,111 @@ docker exec lakehouse-minio sh -c "mc alias set local http://localhost:9000 mini
 
 ---
 
-## How to Run
+## 6. What Each Verification Tool Proves
 
-*Placeholder — exact Docker Compose and `spark-submit` commands will be documented here in the final task once verified.*
+1. **`tools/smoke_test.py`**:
+   - Proves that the Spark container can read/write Parquet via S3A (`s3a://cicd-lakehouse/_smoke/`), connect to Kafka (`kafka:19092`) and read all 3 topic counts (`7,441 / 22,747 / 306`), and perform a Hudi `COPY_ON_WRITE` upsert before cleaning up `_smoke/`.
+2. **`tools/check_contract.py`**:
+   - Read-only check against live Kafka messages proving `100%` JSON schema compliance (`0` null structs, `0` unexpected/missing JSON keys, `0` key mismatches, `0` ISO-8601 UTC format violations) and reporting exact raw vs. distinct key counts (`7,441 -> 7,438`, `22,747 -> 22,744`, `306 -> 303`).
+3. **`tools/verify_bronze.py`**:
+   - Proves that `s3a://cicd-lakehouse/bronze/{builds,tests,deployments}/` have the exact 7 required columns, exact row and distinct key counts, contiguous Kafka offsets `0 .. N-1` with zero gaps or duplicates, and **100% byte-identical `(kafka_partition, kafka_offset, kafka_key, raw_json)` equivalence** against a fresh read from Kafka.
+4. **`tools/verify_silver.py`**:
+   - Proves that `silver_builds` (`7,438`), `silver_tests` (`22,744`), and `silver_deployments` (`303`) contain all 5 Hudi metadata columns (`_hoodie_commit_time`, `_hoodie_record_key`, etc.), exact data schemas, zero duplicate primary keys, exact benchmark key deduplication (`44069120063:1`, `133990467008`, `7769301245` reduced from 4 Bronze rows to 1 Silver row at the highest offset), exact status/conclusion/environment distributions, `0` orphan foreign keys between `silver_tests` and `silver_builds`, and **100% row-by-row equivalence** with an independent deduplication of Bronze.
+5. **`tools/demo_upsert.py`**:
+   - Self-contained synthetic test in `s3a://cicd-lakehouse/_smoke/upsert_demo/` proving that Hudi updates an existing record key `(999000001, 1)` in place from `status='in_progress'` (`T1`) to `status='completed', conclusion='success'` (`T2 > T1`) while keeping the total row count at `2`, documents late-record (`T0 < T1`) behavior across commits, and verifies complete cleanup of `_smoke/`.
+
+---
+
+## 7. Design Decisions & Rationale
+
+1. **`COPY_ON_WRITE` and Unpartitioned Hudi Tables (`NonpartitionedKeyGenerator`)**:
+   - Chosen because the dataset has ~30.5k rows across ~2 months (~11 MB total in MinIO). Unpartitioned `COPY_ON_WRITE` avoids small-file proliferation and Compaction overhead while writing pure Parquet base files that downstream Spark jobs can query rapidly. `NonpartitionedKeyGenerator` in Hudi 0.15 natively supports both single keys (`job_id`, `deployment_id`) and composite keys (`run_id,run_attempt`).
+2. **Composite Primary Key `(run_id, run_attempt)` for `silver_builds`**:
+   - GitHub reuses the same `run_id` when a workflow run is re-executed, incrementing `run_attempt` (`1, 2, 3, ...`). In the snapshot, `7,438` build records share `7,237` distinct `run_id` values (`195` runs have multiple attempts). Keying on `run_id,run_attempt` preserves every distinct attempt.
+3. **Deterministic Batch Deduplication Before Hudi Write (`deduplicate_batch`)**:
+   - All three Silver jobs re-read the full Bronze table and deduplicate in Spark using `Window.partitionBy(key).orderBy(precombine.desc(), source_kafka_offset.desc())` before calling Hudi. This guarantees deterministic tie-breaking when two Kafka messages have identical timestamps (such as the 4 benchmark duplicates) and ensures that out-of-order/late records in Bronze are resolved before Hudi writes.
+   - **Why pre-deduplicating full Bronze in Spark matters (from `tools/demo_upsert.py` Batch 3)**: In `tools/demo_upsert.py` Batch 3, a late record (older `updated_at`) written in a **separate Hudi commit** overwrote the newer row (observed: `status` went back to `'queued'`). The Hudi `precombine` field only protects within one write batch. Our pipeline is safe today because every Silver job re-reads **all** Bronze rows and keeps the latest row per key in Spark before writing. (Warning: switching Silver to an incremental read of new Bronze rows only would require configuring the Hudi payload/ordering behavior and re-testing with `tools/demo_upsert.py` Batch 3; this was **not** tested.)
+4. **Sequential Streaming & `local[2]` Memory Profile**:
+   - Running one topic/table at a time with `--master local[2]`, `--driver-memory 1g`, `spark.sql.shuffle.partitions=4`, and `hoodie.metadata.enable=false` keeps the entire Spark container comfortably inside a `2 GiB` memory limit on laptops with `~3.7 GiB` available RAM.
+5. **Enforced UTC Session Timezone (`spark.sql.session.timeZone=UTC`)**:
+   - All GitHub timestamps end with `'Z'` (UTC). Pinning Spark's session timezone to `UTC` ensures `to_timestamp` and `unix_timestamp` produce identical values regardless of the host machine's local timezone.
+
+---
+
+## 8. Known Limitations
+
+1. **Kafka Broker 4.4.0 vs. `kafka-clients` 3.4.1**:
+   - Spark 3.5.1's `spark-sql-kafka-0-10_2.12:3.5.1` bundles `kafka-clients:3.4.1`, while `ingestion/compose.kafka.yml` runs `apache/kafka:4.4.0`. The Kafka protocol is backward-compatible for `subscribe` and offset reads (verified end-to-end across all 30,494 records), with only benign `AdminClientConfig` unused-config warnings in the logs.
+2. **Approximate `silver_builds.duration_s`**:
+   - Because GitHub's workflow run payload has no `completed_at` field, `duration_s = updated_at - started_at` can be inflated (`75` runs > 24h) when GitHub updates a run object weeks later (e.g., artifact expiration). Downstream analytics should use the median (`61s`), filter outliers (`duration_s <= 86400`), or sum job durations from `silver_tests`.
+3. **Missing Commit Timestamp for DORA Lead Time & Missing Incident Data for CFR/MTTR**:
+   - As documented in Section 5.4, exact commit timestamps (`commits/{sha}`) and production incident/recovery events are not part of the 3 Kafka topics.
+4. **`is_prd_environment` Prefix Assumption**:
+   - Because GitHub returns `production_environment = False` on every deployment in `freeCodeCamp/freeCodeCamp`, `is_prd_environment` is derived from `environment.startswith('prd-')` (`prd-clients`, `prd-api`).
+5. **Late Records Across Separate Hudi Commits (`tools/demo_upsert.py` Batch 3)**:
+   - A late record (older `updated_at`) written in a **separate Hudi commit** overwrote the newer row (observed in `tools/demo_upsert.py` Batch 3: `status` went back from `'completed'` to `'queued'`).
+   - The Hudi `precombine` field only protects within one write batch.
+   - Our pipeline is safe today because every Silver job re-reads **all** Bronze and keeps the latest row per key in Spark (`deduplicate_batch`) before writing.
+   - **Warning**: Switching Silver to an incremental read (new Bronze rows only) would require configuring the Hudi payload/ordering behavior and re-testing with `tools/demo_upsert.py` Batch 3. This was **not** tested.
+
+---
+
+## 9. Troubleshooting
+
+| Symptom / Error | Cause | Fix |
+| :--- | :--- | :--- |
+| `network ingestion_default declared as external, but could not be found` | The Kafka stack (`ingestion/compose.kafka.yml`) has not been started yet. | Start Kafka first: `docker compose -f ingestion/compose.kafka.yml up -d kafka` (or set `KAFKA_NETWORK=<actual_network_name>`). |
+| Kafka container exits with `AccessDeniedException: /var/lib/kafka/data/...` | Fresh Docker volume `ingestion_kafka_data` owned by `root` instead of `appuser`. | Run `docker compose -f ingestion/compose.kafka.yml exec -T -u root kafka chown -R appuser:appuser /var/lib/kafka/data` and restart `kafka`. |
+| `UnknownTopicOrPartitionException` right after starting Kafka | Kafka broker is still electing partition leaders or topics have not been replayed yet. | Wait 5–10 seconds and run `python ingestion/tools/kafka_history.py replay`, then verify with `kafka-get-offsets.sh`. |
+| `$'\r': command not found` when running `submit.sh` or `run_all.sh` | Windows Git converted `.sh` files to `CRLF` line endings. | `lakehouse/.gitattributes` enforces `*.sh text eol=lf`. Run `git checkout -- lakehouse/*.sh` or strip `\r` bytes. |
+| First Spark run takes ~60–90 seconds before printing `[INFO]` | Ivy is downloading Hudi, Spark-Kafka, and Hadoop-AWS JARs into `lakehouse_ivy_cache`. | Wait for download to complete; all subsequent runs reuse `/tmp/ivy` (`0 downloaded`). |
+| `cat /data/cicd-lakehouse/.../hoodie.properties: Is a directory` inside `lakehouse-minio` | MinIO single-drive erasure mode stores every S3 object as a directory containing `xl.meta`. | Use `mc` inside the container: `docker exec lakehouse-minio sh -c "mc alias set local http://localhost:9000 minioadmin minioadmin >/dev/null && mc cat local/cicd-lakehouse/silver/silver_builds/.hoodie/hoodie.properties"`. |
+
+---
+
+## 10. Handover Guide for Teammates
+
+### For Kamal (Member 3 — Gold Layer, DORA Metrics, & MLlib)
+
+- **How to Read the Silver Hudi Tables in PySpark**:
+  Reuse `get_spark("<app_name>")` from `lakehouse/src/spark_session.py` (or configure the same Hudi + S3A options) and load the tables with `format("hudi")`:
+  ```python
+  from config import silver_path
+  from spark_session import get_spark
+
+  spark = get_spark("gold-analytics")
+
+  builds_df = spark.read.format("hudi").load(silver_path("silver_builds"))           # 7,438 rows
+  tests_df = spark.read.format("hudi").load(silver_path("silver_tests"))             # 22,744 rows
+  deployments_df = spark.read.format("hudi").load(silver_path("silver_deployments")) # 303 rows
+  ```
+- **Gold Path Convention**: Write Gold tables to **`s3a://cicd-lakehouse/gold/<table_name>`** inside the same `cicd-lakehouse` bucket.
+- **Key Filters & Traps to Remember**:
+  1. **`silver_builds` Success Rate**: Filter `WHERE conclusion IN ('success', 'failure')` (`5,857` successes vs. `808` failures -> `87.88%` success rate). Exclude `'cancelled'` (`561`), `'action_required'` (`207`), and `'startup_failure'` (`5`).
+  2. **`silver_builds` Duration**: Use median (`percentile_approx(duration_s, 0.5)` = `61s`) or filter `duration_s <= 86400` because `75` runs have `updated_at` touched ~30 days after `started_at`.
+  3. **`silver_tests` Granularity & Null Durations**: Each row is a **GitHub Actions Job** (`73` distinct `job_name` values), joining cleanly to `silver_builds` on `(run_id, run_attempt)` with `0` orphans. Filter `WHERE duration_s IS NOT NULL` when aggregating job durations (`3,654` skipped and `138` cancelled jobs have `duration_s IS NULL`).
+  4. **`silver_deployments` DORA Queries**: Never filter on `latest_status = 'success'` (most rows are `'inactive'`) or `production_environment = True` (always `False`). Filter successful production deployments with **`WHERE is_prd_environment = True AND was_successful = True`** (`144` rows) and use **`first_success_at`** as the deployment completion timestamp.
+
+### For Youssef (Member 4 — Airflow Orchestration)
+
+- **Single Command to Trigger the Entire Bronze + Silver + Verification Pipeline**:
+  ```bash
+  docker compose -f lakehouse/compose.lakehouse.yml run --rm --entrypoint bash spark /opt/lakehouse/run_all.sh
+  ```
+- **Granular Step Execution for Separate Airflow Tasks (`BashOperator`)**:
+  Use `--only <step_name>` so each Airflow task runs independently and receives a non-zero exit code on failure:
+  ```bash
+  docker compose -f lakehouse/compose.lakehouse.yml run --rm --entrypoint bash spark /opt/lakehouse/run_all.sh --only bronze_ingest
+  docker compose -f lakehouse/compose.lakehouse.yml run --rm --entrypoint bash spark /opt/lakehouse/run_all.sh --only silver_builds
+  docker compose -f lakehouse/compose.lakehouse.yml run --rm --entrypoint bash spark /opt/lakehouse/run_all.sh --only silver_tests
+  docker compose -f lakehouse/compose.lakehouse.yml run --rm --entrypoint bash spark /opt/lakehouse/run_all.sh --only silver_deployments
+  docker compose -f lakehouse/compose.lakehouse.yml run --rm --entrypoint bash spark /opt/lakehouse/run_all.sh --only verify_bronze
+  docker compose -f lakehouse/compose.lakehouse.yml run --rm --entrypoint bash spark /opt/lakehouse/run_all.sh --only verify_silver
+  ```
+- **Idempotency & Exit Codes**: Every step is idempotent (`bronze_ingest` resumes from its S3A checkpoint and ingests `0` rows when no new Kafka offsets exist; Silver jobs deterministically deduplicate and upsert into Hudi) and propagates a non-zero exit code (`$? != 0`) to the host if any ingestion or assertion fails.
+
+### For Badr (Member 1 — Ingestion & Collector Alignment)
+
+- **Confirmed Data Contract (`tools/check_contract.py`)**:
+  - `src/schemas.py` matches `ingestion/src/collector/transform.py` across all `30,494` messages (`builds=7,441`, `tests=22,747`, `deployments=306`) with `0` unparsed rows, `0` key mismatches, and `0` unexpected/missing fields.
+  - Note that `transform.py` always sets `builds.duration_s = None` (computed in `silver_builds.py` as `updated_at - started_at`) and rejects negative `tests.duration_s` values (`138` cancelled jobs where `completed_at < started_at` by 1s are stored as `None`).
