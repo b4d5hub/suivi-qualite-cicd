@@ -18,3 +18,11 @@ ingestion/state/
 # Logs and operating system files
 *.log
 .DS_Store
+
+# Lakehouse / Spark / Hudi local artifacts
+spark-warehouse/
+metastore_db/
+derby.log
+.hoodie/
+lakehouse/data/
+lakehouse/checkpoints/
